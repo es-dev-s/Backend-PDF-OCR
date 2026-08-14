@@ -129,8 +129,9 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		s.cleanup(written)
 		return Document{}, err
 	}
-	s.enqueueHash(context.WithoutCancel(ctx), written)
-	s.enqueueTitle(context.WithoutCancel(ctx), written)
+	bg := context.WithoutCancel(ctx)
+	s.hashSources(bg, written)
+	s.enqueueTitle(bg, written)
 	out, err := s.repo.Get(ctx, doc.ID)
 	if err != nil {
 		return Document{}, err
@@ -157,7 +158,7 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 		return Document{}, err
 	}
 	bg := context.WithoutCancel(ctx)
-	s.enqueueHash(bg, written)
+	s.hashSources(bg, written)
 	s.enqueueTitle(bg, written)
 	out, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -288,7 +289,7 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 				ContentType: ctype,
 				SizeBytes:   fh.Size,
 				Uniqueness:  Unique,
-				Uploaded:    now,
+				Uploaded:    now.Add(time.Duration(i) * time.Millisecond),
 				NeedsTitle:  sniffed == "pdf" && !provided,
 			}
 			mu.Unlock()
@@ -299,6 +300,15 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 		return nonEmpty(out), err
 	}
 	return out, nil
+}
+
+func (s *Service) hashSources(ctx context.Context, sources []Source) {
+	for _, src := range sources {
+		if ctx.Err() != nil {
+			return
+		}
+		s.hashSource(ctx, src)
+	}
 }
 
 func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
@@ -478,7 +488,7 @@ func (s *Service) hashSource(ctx context.Context, src Source) {
 		if err != nil {
 			return err
 		}
-		fp, err := fingerprint.Analyze(path, src.Title, src.ContentType)
+		fp, err := fingerprint.Analyze(path, filepath.Base(src.StorageKey), src.ContentType)
 		if err != nil {
 			return err
 		}

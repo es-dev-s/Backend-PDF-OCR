@@ -6,7 +6,7 @@ import (
 )
 
 func TestNormalizeAndSimHash(t *testing.T) {
-	base := strings.Repeat("visa application supporting statement for skilled migration ", 12)
+	base := strings.Repeat("visa application supporting statement for skilled migration ", 16)
 	a := Normalize("Hello,  WORLD!!\nThis is a test document about visas. " + base)
 	b := Normalize("hello world this is a test document about visas " + base)
 	if a != b {
@@ -20,7 +20,7 @@ func TestNormalizeAndSimHash(t *testing.T) {
 	if Hamming(ha, hb) != 0 {
 		t.Fatal("expected identical hashes")
 	}
-	other := strings.Repeat("garden cooking recipe ingredients oven temperature ", 12)
+	other := strings.Repeat("garden cooking recipe ingredients oven temperature ", 16)
 	c := SimHash64(Tokens(Normalize("completely different content about cooking recipes and gardens " + other)))
 	if c == 0 {
 		t.Fatal("expected a simhash for long unrelated text")
@@ -34,17 +34,41 @@ func TestIsDuplicateThresholds(t *testing.T) {
 	if !IsDuplicate(KindExact, 100, 1, 99) {
 		t.Fatal("exact bytes must match regardless of page count")
 	}
-	if !IsDuplicate(KindText, 99.5, 12, 3) {
-		t.Fatal("identical extracted text is a duplicate")
+	if IsDuplicate(KindText, 99.5, 12, 3) {
+		t.Fatal("identical extracted text with different page counts must not count")
 	}
-	if IsDuplicate(KindText, 90.6, 12, 12) {
-		t.Fatal("loose simhash must not count as a duplicate")
+	if !IsDuplicate(KindText, 99.5, 12, 12) {
+		t.Fatal("identical extracted text with matching pages is a duplicate")
+	}
+	if !IsDuplicate(KindText, 98.4375, 8, 8) {
+		t.Fatal("simhash distance 1 with matching pages is a duplicate")
+	}
+	if IsDuplicate(KindText, ScoreFromDistance(2, 64), 12, 12) {
+		t.Fatal("simhash distance 2 must not count as a duplicate")
 	}
 	if IsDuplicate(KindVisual, 84.0, 4, 4) {
 		t.Fatal("loose phash must not count as a duplicate")
 	}
-	if IsDuplicate(KindVisual, 96, 4, 9) {
+	if IsDuplicate(KindVisual, 96, 4, 4) {
+		t.Fatal("visual distance above 1 must not count")
+	}
+	if IsDuplicate(KindVisual, 98.5, 4, 9) {
 		t.Fatal("visual match with different page counts must not count")
+	}
+	if !IsDuplicate(KindVisual, 98.5, 1, 1) {
+		t.Fatal("visual distance 1 with matching pages is a duplicate")
+	}
+}
+
+func TestTextIsSubstantial(t *testing.T) {
+	if textIsSubstantial(400, 64, 12) {
+		t.Fatal("header-sized text on a long PDF must not fingerprint")
+	}
+	if !textIsSubstantial(800, 96, 1) {
+		t.Fatal("substantial single-page text should fingerprint")
+	}
+	if !textIsSubstantial(12*80, 96, 12) {
+		t.Fatal("enough text per page should fingerprint")
 	}
 }
 

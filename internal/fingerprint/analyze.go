@@ -89,7 +89,7 @@ func textIsSubstantial(runes, tokens, pages int) bool {
 	if pages <= 1 {
 		return true
 	}
-	return runes >= pages*30
+	return runes >= pages*MinRunesPerPage
 }
 
 func analyzeImage(path string, out *Result) {

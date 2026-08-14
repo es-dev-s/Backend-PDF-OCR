@@ -241,7 +241,7 @@ func queryExact(ctx context.Context, q querier, except uuid.UUID, sha string) ([
 
 func queryTextExact(ctx context.Context, q querier, except uuid.UUID, norm string) ([]HashMatch, error) {
 	rows, err := q.Query(ctx, `
-		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.member, s.uniqueness, s.created_at
+		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.member, s.uniqueness, s.created_at, s.page_count
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.text_norm_sha256 = $1 AND s.id <> $2
@@ -250,7 +250,17 @@ func queryTextExact(ctx context.Context, q querier, except uuid.UUID, norm strin
 		return nil, err
 	}
 	defer rows.Close()
-	return scanMatches(rows, fingerprint.KindText, 99.5)
+	out := make([]HashMatch, 0)
+	for rows.Next() {
+		var m HashMatch
+		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.Member, &m.Uniqueness, &m.Uploaded, &m.PageCount); err != nil {
+			return nil, err
+		}
+		m.Kind = fingerprint.KindText
+		m.Score = 99.5
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func queryLSH(ctx context.Context, q querier, except uuid.UUID, kind string, hash uint64, maxDist int) ([]HashMatch, error) {

@@ -12,16 +12,17 @@ const (
 	KindText   = "text"
 	KindVisual = "visual"
 
-	MinTextRunes     = 400
-	MinTokens        = 64
-	SimHashMaxDist   = 2
-	PHashMaxDist     = 3
+	MinTextRunes     = 800
+	MinTokens        = 96
+	MinRunesPerPage  = 80
+	SimHashMaxDist   = 1
+	PHashMaxDist     = 1
 	MaxTextPages     = 20
 	MaxVisualPages   = 3
 	LSHBands         = 4
-	MinExactScore    = 99.0
-	MinTextNearScore = 96.5
-	MinVisualScore   = 95.0
+	MinExactScore    = 99.9
+	MinTextNearScore = 98.0
+	MinVisualScore   = 98.0
 )
 
 func Sniff(head []byte, filename string) string {
@@ -131,11 +132,8 @@ func PagesCompatible(a, b int) bool {
 func IsDuplicate(kind string, score float64, pagesA, pagesB int) bool {
 	switch kind {
 	case KindExact:
-		return score >= 99.9
+		return score >= MinExactScore
 	case KindText:
-		if score >= MinExactScore {
-			return true
-		}
 		return score >= MinTextNearScore && PagesCompatible(pagesA, pagesB)
 	case KindVisual:
 		return score >= MinVisualScore && PagesCompatible(pagesA, pagesB)

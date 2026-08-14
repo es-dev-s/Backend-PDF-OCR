@@ -56,7 +56,7 @@ func Load() (Config, error) {
 		WorkerN:            capWorkers(int(envInt64("WORKER_CONCURRENCY", 2)), hosted()),
 		PGMaxConns:         int32(envInt64("PG_MAX_CONNS", 8)),
 		RedisPoolSize:      int(envInt64("REDIS_POOL_SIZE", 8)),
-		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 4)),
+		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 8)),
 		Heartbeat:          time.Duration(envInt64("HEARTBEAT_SECONDS", 2)) * time.Second,
 		ShutdownTimeout:    time.Duration(envInt64("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 		EngineURL:          env("ENGINE_BASE_URL", "http://127.0.0.1:8000"),
@@ -68,7 +68,7 @@ func Load() (Config, error) {
 		cfg.MaxSources = 4
 	}
 	if cfg.MaxInflightUploads < 1 {
-		cfg.MaxInflightUploads = 4
+		cfg.MaxInflightUploads = 8
 	}
 	if hosted() {
 		if cfg.PGMaxConns > 8 {
@@ -77,8 +77,8 @@ func Load() (Config, error) {
 		if cfg.RedisPoolSize > 8 {
 			cfg.RedisPoolSize = 8
 		}
-		if cfg.MaxInflightUploads > 4 {
-			cfg.MaxInflightUploads = 4
+		if cfg.MaxInflightUploads > 8 {
+			cfg.MaxInflightUploads = 8
 		}
 	}
 	if cfg.PGMaxConns < 4 {

@@ -57,7 +57,7 @@ func New(
 ) *Server {
 	n := cfg.MaxInflightUploads
 	if n < 1 {
-		n = 4
+		n = 8
 	}
 	return &Server{
 		cfg:     cfg,
@@ -274,7 +274,7 @@ func (s *Server) nextERP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) acquireUpload(ctx context.Context) bool {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	select {
 	case s.uploads <- struct{}{}:
@@ -291,9 +291,14 @@ func (s *Server) releaseUpload() {
 	}
 }
 
+func (s *Server) writeBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "2")
+	writeErrCode(w, http.StatusServiceUnavailable, "busy", "server is busy; retry shortly")
+}
+
 func (s *Server) createDocument(w http.ResponseWriter, r *http.Request) {
 	if !s.acquireUpload(r.Context()) {
-		writeErrCode(w, http.StatusServiceUnavailable, "busy", "upload queue is full")
+		s.writeBusy(w)
 		return
 	}
 	defer s.releaseUpload()
@@ -317,7 +322,7 @@ func (s *Server) addSources(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.acquireUpload(r.Context()) {
-		writeErrCode(w, http.StatusServiceUnavailable, "busy", "upload queue is full")
+		s.writeBusy(w)
 		return
 	}
 	defer s.releaseUpload()
@@ -405,6 +410,11 @@ func (s *Server) markAllRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) inspectFile(w http.ResponseWriter, r *http.Request) {
+	if !s.acquireUpload(r.Context()) {
+		s.writeBusy(w)
+		return
+	}
+	defer s.releaseUpload()
 	fh, f, ok := openOneUpload(w, r, s.cfg.MaxUploadBytes)
 	if !ok {
 		return
@@ -414,6 +424,11 @@ func (s *Server) inspectFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) suggestTitle(w http.ResponseWriter, r *http.Request) {
+	if !s.acquireUpload(r.Context()) {
+		s.writeBusy(w)
+		return
+	}
+	defer s.releaseUpload()
 	fh, f, ok := openOneUpload(w, r, s.cfg.MaxUploadBytes)
 	if !ok {
 		return

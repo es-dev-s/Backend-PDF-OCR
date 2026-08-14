@@ -24,7 +24,7 @@ func New(n int, log *slog.Logger) *Pool {
 	}
 	return &Pool{
 		log:  log,
-		jobs: make(chan Job, n*4),
+		jobs: make(chan Job, 256),
 	}
 }
 
@@ -37,6 +37,13 @@ func (p *Pool) Start(parent context.Context, n int) {
 		p.wg.Add(1)
 		go p.loop()
 	}
+}
+
+func (p *Pool) Context() context.Context {
+	if p == nil || p.ctx == nil {
+		return context.Background()
+	}
+	return p.ctx
 }
 
 func (p *Pool) loop() {
@@ -61,8 +68,11 @@ func (p *Pool) loop() {
 }
 
 func (p *Pool) Submit(ctx context.Context, job Job) error {
-	if p.ctx == nil {
+	if p == nil || p.ctx == nil {
 		return context.Canceled
+	}
+	if ctx == nil {
+		ctx = p.ctx
 	}
 	select {
 	case <-p.ctx.Done():

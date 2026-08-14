@@ -42,9 +42,9 @@ type Service struct {
 	log     *slog.Logger
 	maxN    int
 	maxB    int64
-	inspect chan struct{}
 	hashing sync.Map
 	heavy   chan struct{}
+	put     chan struct{}
 }
 
 func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Pool, notes Notifier, eng *engine.Client, log *slog.Logger, maxSources int, maxBytes int64) *Service {
@@ -52,17 +52,17 @@ func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Po
 		maxSources = 4
 	}
 	return &Service{
-		repo:    repo,
-		blob:    store,
-		hub:     hub,
-		pool:    pool,
-		notes:   notes,
-		engine:  eng,
-		log:     log,
-		maxN:    maxSources,
-		maxB:    maxBytes,
-		inspect: make(chan struct{}, 1),
-		heavy:   make(chan struct{}, 1),
+		repo:   repo,
+		blob:   store,
+		hub:    hub,
+		pool:   pool,
+		notes:  notes,
+		engine: eng,
+		log:    log,
+		maxN:   maxSources,
+		maxB:   maxBytes,
+		heavy:  make(chan struct{}, 1),
+		put:    make(chan struct{}, 2),
 	}
 }
 
@@ -133,8 +133,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		s.cleanup(written)
 		return Document{}, err
 	}
-	bg := context.WithoutCancel(ctx)
-	s.hashSources(bg, written)
+	bg := s.jobContext()
+	s.enqueueHash(bg, written)
 	s.enqueueTitle(bg, written)
 	out, err := s.repo.Get(ctx, doc.ID)
 	if err != nil {
@@ -161,8 +161,8 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 		s.cleanup(written)
 		return Document{}, err
 	}
-	bg := context.WithoutCancel(ctx)
-	s.hashSources(bg, written)
+	bg := s.jobContext()
+	s.enqueueHash(bg, written)
 	s.enqueueTitle(bg, written)
 	out, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -332,7 +332,12 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 				reader = io.MultiReader(bytes.NewReader(head), f)
 			}
 			limited := &limitErrReader{r: reader, max: s.maxB}
-			if err := s.blob.Put(ctx, key, limited, fh.Size, ctype); err != nil {
+			if err := s.acquirePut(ctx); err != nil {
+				return err
+			}
+			err = s.blob.Put(ctx, key, limited, fh.Size, ctype)
+			s.releasePut()
+			if err != nil {
 				return err
 			}
 			provided := i < len(titles) && strings.TrimSpace(titles[i]) != ""
@@ -374,6 +379,10 @@ func (s *Service) hashSources(ctx context.Context, sources []Source) {
 }
 
 func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
+	if s.pool == nil {
+		s.hashSources(ctx, sources)
+		return
+	}
 	for _, src := range sources {
 		src := src
 		if _, loaded := s.hashing.Load(src.ID.String()); loaded {
@@ -389,6 +398,14 @@ func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
 
 func (s *Service) enqueueTitle(ctx context.Context, sources []Source) {
 	if s.engine == nil || !s.engine.Configured() {
+		return
+	}
+	if s.pool == nil {
+		for _, src := range sources {
+			if src.NeedsTitle {
+				s.titleSource(ctx, src)
+			}
+		}
 		return
 	}
 	for _, src := range sources {
@@ -412,11 +429,10 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 		Matches:    []PreviewMatch{},
 	}
 	select {
-	case s.inspect <- struct{}{}:
-		defer func() { <-s.inspect }()
 	case <-ctx.Done():
 		out.OK = false
 		return out
+	default:
 	}
 	if !s.acquireHeavy(ctx) {
 		out.OK = false
@@ -692,6 +708,35 @@ func (s *Service) releaseHeavy() {
 		<-s.heavy
 	}
 	debug.FreeOSMemory()
+}
+
+func (s *Service) acquirePut(ctx context.Context) error {
+	if s.put == nil {
+		return nil
+	}
+	select {
+	case s.put <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) releasePut() {
+	if s.put == nil {
+		return
+	}
+	select {
+	case <-s.put:
+	default:
+	}
+}
+
+func (s *Service) jobContext() context.Context {
+	if s.pool != nil {
+		return s.pool.Context()
+	}
+	return context.Background()
 }
 
 func sanitizeName(name string) string {

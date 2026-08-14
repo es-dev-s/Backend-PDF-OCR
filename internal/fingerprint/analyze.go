@@ -29,6 +29,14 @@ func Missing(sourceID string) Result {
 	}
 }
 
+func Digest(path string) (Result, error) {
+	sum, err := hashFile(path)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{SHA256: sum, Kind: "sha"}, nil
+}
+
 func Analyze(path, filename, contentType string) (Result, error) {
 	var out Result
 	sum, err := hashFile(path)
@@ -75,8 +83,9 @@ func analyzePDF(path string, out *Result) {
 			out.SimHash = SimHash64(tokens)
 		}
 	}
-	// Do not rasterize PDFs. pdftoppm/pdfcpu can exceed a small Railway cgroup
-	// and uniqueness still matches identical files via SHA-256.
+	// Go never rasterizes PDFs and never loads a full PDF object model.
+	// Text fingerprints use pdftotext when present; otherwise SHA-256 only.
+	// Titles go to the Python engine (PyMuPDF), not this process.
 }
 
 func textIsSubstantial(runes, tokens, pages int) bool {

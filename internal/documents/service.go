@@ -246,7 +246,7 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 }
 
 func (s *Service) RecoverPending(ctx context.Context) {
-	sources, err := s.repo.ListUnhashed(ctx, 4)
+	sources, err := s.repo.ListUnhashed(ctx, 1)
 	if err != nil {
 		if !errors.Is(err, ErrUnavailable) {
 			s.log.Warn("recover pending failed", "err", err)
@@ -273,8 +273,13 @@ func (s *Service) RunRecovery(ctx context.Context) {
 		case <-wait.C:
 		}
 	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(20 * time.Second):
+	}
 	s.RecoverPending(ctx)
-	t := time.NewTicker(45 * time.Second)
+	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -447,9 +452,9 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 	}
 	defer os.Remove(path)
 
-	fp, err := fingerprint.Analyze(path, filename, "")
+	fp, err := fingerprint.Digest(path)
 	if err != nil {
-		s.log.Warn("inspect analyze failed", "err", err, "file", filename)
+		s.log.Warn("inspect digest failed", "err", err, "file", filename)
 		out.OK = false
 		return out
 	}

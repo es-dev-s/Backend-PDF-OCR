@@ -22,6 +22,7 @@ import (
 	"ocr-backend/internal/config"
 	"ocr-backend/internal/documents"
 	"ocr-backend/internal/engine"
+	"ocr-backend/internal/memlimit"
 	"ocr-backend/internal/notifications"
 	"ocr-backend/internal/postgres"
 	"ocr-backend/internal/realtime"
@@ -156,6 +157,12 @@ func (s *Server) snapshot(_ context.Context) healthPayload {
 		checks["engine"] = "ok"
 	} else {
 		checks["engine"] = "off"
+	}
+	checks["gomemlimit"] = memlimit.Format(memlimit.Current())
+	if cg := memlimit.CgroupLimit(); cg > 0 {
+		checks["cgroup_memory"] = memlimit.Format(cg)
+	} else {
+		checks["cgroup_memory"] = "unlimited"
 	}
 
 	ready := pg == "ok" && rd == "ok"

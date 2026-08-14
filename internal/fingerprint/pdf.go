@@ -3,29 +3,15 @@ package fingerprint
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/ledongthuc/pdf"
 )
 
 func ExtractPDFText(path string) (text string, pages int, err error) {
-	if text, pages, err = extractPDFTextPoppler(path); err == nil {
-		return capText(text), pages, nil
-	}
-	info, statErr := os.Stat(path)
-	if statErr == nil && info.Size() > 8<<20 {
-		return "", 0, nil
-	}
-	text, pages, err = extractPDFTextGo(path)
-	if err != nil {
-		return "", pages, err
-	}
-	return capText(text), pages, nil
+	return extractPDFTextPoppler(path)
 }
 
 func extractPDFTextPoppler(path string) (string, int, error) {
@@ -40,7 +26,7 @@ func extractPDFTextPoppler(path string) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	return string(out), pdfPageCount(path), nil
+	return capText(string(out)), pdfPageCount(path), nil
 }
 
 func pdfPageCount(path string) int {
@@ -65,41 +51,6 @@ func pdfPageCount(path string) int {
 		}
 	}
 	return 0
-}
-
-func extractPDFTextGo(path string) (text string, pages int, err error) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			err = fmt.Errorf("pdf parse panic: %v", rec)
-		}
-	}()
-	f, r, err := pdf.Open(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer f.Close()
-	pages = r.NumPage()
-	var b strings.Builder
-	limit := pages
-	if limit > MaxTextPages {
-		limit = MaxTextPages
-	}
-	for i := 1; i <= limit; i++ {
-		if b.Len() >= MaxTextBytes {
-			break
-		}
-		p := r.Page(i)
-		if p.V.IsNull() {
-			continue
-		}
-		plain, perr := p.GetPlainText(nil)
-		if perr != nil {
-			continue
-		}
-		b.WriteString(plain)
-		b.WriteByte('\n')
-	}
-	return b.String(), pages, nil
 }
 
 func capText(s string) string {

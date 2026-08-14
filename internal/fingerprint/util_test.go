@@ -1,6 +1,7 @@
 package fingerprint
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -103,5 +104,22 @@ func TestCapText(t *testing.T) {
 	got := capText(long)
 	if len(got) != MaxTextBytes {
 		t.Fatalf("len=%d want %d", len(got), MaxTextBytes)
+	}
+}
+
+func TestDigestIsChunkedAndStable(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/blob.bin"
+	payload := strings.Repeat("ocr-fingerprint-bytes-", 4096)
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Digest(path)
+	if err != nil || a.SHA256 == "" || a.Kind != "sha" {
+		t.Fatalf("digest=%+v err=%v", a, err)
+	}
+	b, err := Digest(path)
+	if err != nil || a.SHA256 != b.SHA256 {
+		t.Fatalf("digest must be stable")
 	}
 }

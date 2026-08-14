@@ -27,7 +27,7 @@ import (
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
-	mem := memlimit.Apply(hosted)
+	memlimit.Apply(hosted)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("config", "err", err)
@@ -96,7 +96,14 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr, "storage", store.Driver(), "prefix", cfg.R2Prefix, "workers", cfg.WorkerN, "memlimit", mem)
+		log.Info("listening",
+			"addr", cfg.HTTPAddr,
+			"storage", store.Driver(),
+			"prefix", cfg.R2Prefix,
+			"workers", cfg.WorkerN,
+			"memlimit", memlimit.Format(memlimit.Current()),
+			"cgroup", memlimit.Format(memlimit.CgroupLimit()),
+		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server", "err", err)
 			stop()

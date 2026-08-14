@@ -548,49 +548,61 @@ func (s *Service) hashSource(ctx context.Context, src Source) {
 			return nil
 		}
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
+		if errors.Is(err, blob.ErrNotFound) {
+			s.log.Warn("source blob missing; finishing uniqueness without file", "source", src.ID, "key", src.StorageKey)
+			return s.publishFingerprint(ctx, src, fingerprint.Missing(src.ID.String()))
+		}
 		if err != nil {
 			return err
 		}
 		fp, err := fingerprint.Analyze(path, filepath.Base(src.StorageKey), src.ContentType)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				s.log.Warn("source file gone; finishing uniqueness without file", "source", src.ID, "key", src.StorageKey)
+				return s.publishFingerprint(ctx, src, fingerprint.Missing(src.ID.String()))
+			}
 			return err
 		}
-		result, err := s.repo.FinalizeFingerprint(ctx, src, fp)
-		if err != nil {
-			return err
-		}
-		for _, id := range result.Touched {
-			doc, err := s.repo.Get(ctx, id)
-			if err != nil {
-				if errors.Is(err, ErrNotFound) {
-					continue
-				}
-				return err
-			}
-			s.hub.Publish(ctx, "document.updated", doc)
-			notified := false
-			for _, nid := range result.Notified {
-				if nid == id {
-					notified = true
-					break
-				}
-			}
-			if !notified || s.notes == nil {
-				continue
-			}
-			title := "Document processed"
-			detail := fmt.Sprintf("%s finished processing", doc.Title)
-			if doc.Status == StatusDuplicate {
-				title = "Duplicate found"
-				detail = fmt.Sprintf("%s has duplicate sources", doc.Title)
-			}
-			_ = s.notes.Create(ctx, title, detail)
-		}
-		return nil
+		return s.publishFingerprint(ctx, src, fp)
 	})
-	if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
+	if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, blob.ErrNotFound) && !errors.Is(err, context.Canceled) {
 		s.log.Error("hash source failed", "err", err, "source", src.ID)
 	}
+}
+
+func (s *Service) publishFingerprint(ctx context.Context, src Source, fp fingerprint.Result) error {
+	result, err := s.repo.FinalizeFingerprint(ctx, src, fp)
+	if err != nil {
+		return err
+	}
+	for _, id := range result.Touched {
+		doc, err := s.repo.Get(ctx, id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return err
+		}
+		s.hub.Publish(ctx, "document.updated", doc)
+		notified := false
+		for _, nid := range result.Notified {
+			if nid == id {
+				notified = true
+				break
+			}
+		}
+		if !notified || s.notes == nil {
+			continue
+		}
+		title := "Document processed"
+		detail := fmt.Sprintf("%s finished processing", doc.Title)
+		if doc.Status == StatusDuplicate {
+			title = "Duplicate found"
+			detail = fmt.Sprintf("%s has duplicate sources", doc.Title)
+		}
+		_ = s.notes.Create(ctx, title, detail)
+	}
+	return nil
 }
 
 func (s *Service) cleanup(sources []Source) {

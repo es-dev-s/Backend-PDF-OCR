@@ -63,3 +63,11 @@ func TestFingerprintLockKeysVisual(t *testing.T) {
 		}
 	}
 }
+
+func TestFingerprintLockKeysMissingBlob(t *testing.T) {
+	fp := fingerprint.Missing("src-1")
+	keys := fingerprintLockKeys(fp)
+	if len(keys) != 1 || keys[0] != "sha:"+fp.SHA256 {
+		t.Fatalf("missing blob should only lock its placeholder sha, got %v", keys)
+	}
+}

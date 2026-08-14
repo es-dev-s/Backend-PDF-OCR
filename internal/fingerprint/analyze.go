@@ -19,6 +19,16 @@ type Result struct {
 	Kind        string
 }
 
+// Missing is a unique placeholder hash for a source whose blob is gone.
+// It lets uniqueness finish instead of leaving the document on processing forever.
+func Missing(sourceID string) Result {
+	sum := sha256.Sum256([]byte("missing:" + sourceID))
+	return Result{
+		SHA256: hex.EncodeToString(sum[:]),
+		Kind:   "missing",
+	}
+}
+
 func Analyze(path, filename, contentType string) (Result, error) {
 	var out Result
 	sum, err := hashFile(path)

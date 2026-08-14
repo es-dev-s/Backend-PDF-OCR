@@ -79,3 +79,18 @@ func TestBands(t *testing.T) {
 		t.Fatalf("bands=%v", b)
 	}
 }
+
+func TestMissingHashIsStableAndUnique(t *testing.T) {
+	a := Missing("source-a")
+	again := Missing("source-a")
+	b := Missing("source-b")
+	if a.SHA256 == "" || a.Kind != "missing" {
+		t.Fatalf("missing fingerprint incomplete: %+v", a)
+	}
+	if a.SHA256 != again.SHA256 {
+		t.Fatal("missing hash must be stable for the same source")
+	}
+	if a.SHA256 == b.SHA256 {
+		t.Fatal("missing hashes must not collide across sources")
+	}
+}

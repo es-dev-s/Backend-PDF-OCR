@@ -129,11 +129,14 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 		}
 		matches = confidentMatches(fp, matches)
 
-		kind := "unique"
-		if fp.HasText {
-			kind = "text"
-		} else if fp.HasVisual {
-			kind = "visual"
+		kind := fp.Kind
+		if kind == "" || kind == "pdf" || kind == "image" {
+			kind = "unique"
+			if fp.HasText {
+				kind = "text"
+			} else if fp.HasVisual {
+				kind = "visual"
+			}
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE sources SET

@@ -124,10 +124,9 @@ func (l *Local) Delete(_ context.Context, key string) error {
 }
 
 func (l *Local) resolve(key string) (string, error) {
-	clean := filepath.Clean("/" + strings.ReplaceAll(key, "\\", "/"))
-	clean = strings.TrimPrefix(clean, "/")
-	if clean == "" || strings.Contains(clean, "..") {
-		return "", fmt.Errorf("invalid storage key")
+	clean, err := cleanKey(key)
+	if err != nil {
+		return "", err
 	}
 	full := filepath.Join(l.root, filepath.FromSlash(clean))
 	rel, err := filepath.Rel(l.root, full)
@@ -135,21 +134,4 @@ func (l *Local) resolve(key string) (string, error) {
 		return "", fmt.Errorf("invalid storage key")
 	}
 	return full, nil
-}
-
-func contentTypeFor(path string) string {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".pdf":
-		return "application/pdf"
-	case ".png":
-		return "image/png"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".webp":
-		return "image/webp"
-	case ".tif", ".tiff":
-		return "image/tiff"
-	default:
-		return "application/octet-stream"
-	}
 }

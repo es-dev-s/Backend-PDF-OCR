@@ -16,6 +16,12 @@ type Config struct {
 	RedisURL           string
 	StorageDriver      string
 	StorageDir         string
+	R2AccountID        string
+	R2AccessKey        string
+	R2Secret           string
+	R2Bucket           string
+	R2Endpoint         string
+	R2Prefix           string
 	CORSOrigins        []string
 	MaxUploadBytes     int64
 	MaxSources         int
@@ -38,6 +44,12 @@ func Load() (Config, error) {
 		RedisURL:           strings.TrimSpace(os.Getenv("REDIS_URL")),
 		StorageDriver:      env("STORAGE_DRIVER", "local"),
 		StorageDir:         env("STORAGE_DIR", "./data/uploads"),
+		R2AccountID:        env("R2_ACCOUNT_ID", ""),
+		R2AccessKey:        env("R2_ACCESS_KEY_ID", ""),
+		R2Secret:           env("R2_SECRET_ACCESS_KEY", ""),
+		R2Bucket:           env("R2_BUCKET", ""),
+		R2Endpoint:         env("R2_ENDPOINT", ""),
+		R2Prefix:           env("R2_PREFIX", "ocr/v1"),
 		CORSOrigins:        splitCSV(env("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")),
 		MaxUploadBytes:     envInt64("MAX_UPLOAD_BYTES", 50<<20),
 		MaxSources:         int(envInt64("MAX_SOURCES", 4)),
@@ -66,6 +78,12 @@ func Load() (Config, error) {
 	}
 	if cfg.StorageDriver == "" {
 		cfg.StorageDriver = "local"
+	}
+	if strings.EqualFold(cfg.StorageDriver, "r2") || strings.EqualFold(cfg.StorageDriver, "s3") {
+		cfg.StorageDriver = "r2"
+		if cfg.R2AccountID == "" || cfg.R2AccessKey == "" || cfg.R2Secret == "" || cfg.R2Bucket == "" {
+			return cfg, fmt.Errorf("R2 storage requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET")
+		}
 	}
 	if cfg.HTTPAddr == "" {
 		return cfg, fmt.Errorf("HTTP_ADDR is required")

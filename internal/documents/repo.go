@@ -160,7 +160,8 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 	}
 	mrows, err := db.Query(ctx, `
 		SELECT dm.id, dm.source_id, dm.matched_source_id, dm.title, dm.erp, dm.score, dm.uploaded_at, dm.kind,
-		       COALESCE(ms.uniqueness, 'unique'), COALESCE(md.client, ''), COALESCE(md.member, '')
+		       COALESCE(ms.uniqueness, 'unique'), COALESCE(md.client, ''), COALESCE(md.member, ''),
+		       md.id, COALESCE(ms.content_type, '')
 		FROM duplicate_matches dm
 		JOIN sources ms ON ms.id = dm.matched_source_id
 		JOIN documents md ON md.id = ms.document_id
@@ -174,9 +175,13 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 		var m DuplicateMatch
 		var sourceID uuid.UUID
 		var matchedID uuid.UUID
-		if err := mrows.Scan(&m.ID, &sourceID, &matchedID, &m.Title, &m.ERP, &m.Score, &m.Uploaded, &m.Kind, &m.Uniqueness, &m.Client, &m.Member); err != nil {
+		var matchedDoc uuid.UUID
+		if err := mrows.Scan(&m.ID, &sourceID, &matchedID, &m.Title, &m.ERP, &m.Score, &m.Uploaded, &m.Kind, &m.Uniqueness, &m.Client, &m.Member, &matchedDoc, &m.ContentType); err != nil {
 			return err
 		}
+		m.SourceID = matchedID
+		m.DocumentID = matchedDoc
+		m.FileURL = fileURL(matchedDoc, matchedID)
 		if src := sourceByID[sourceID]; src != nil {
 			src.Duplicates = append(src.Duplicates, m)
 		}

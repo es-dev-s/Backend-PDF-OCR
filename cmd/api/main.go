@@ -30,7 +30,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	store, err := blob.NewLocal(cfg.StorageDir)
+	store, err := blob.New(blob.Options{
+		Driver:   cfg.StorageDriver,
+		LocalDir: cfg.StorageDir,
+		R2: blob.R2Options{
+			AccountID: cfg.R2AccountID,
+			AccessKey: cfg.R2AccessKey,
+			Secret:    cfg.R2Secret,
+			Bucket:    cfg.R2Bucket,
+			Endpoint:  cfg.R2Endpoint,
+			Prefix:    cfg.R2Prefix,
+		},
+	})
 	if err != nil {
 		log.Error("storage", "err", err)
 		os.Exit(1)
@@ -66,7 +77,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr, "storage", cfg.StorageDir)
+		log.Info("listening", "addr", cfg.HTTPAddr, "storage", store.Driver(), "prefix", cfg.R2Prefix)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server", "err", err)
 			stop()

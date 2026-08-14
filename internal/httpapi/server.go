@@ -371,6 +371,7 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, name))
 	w.Header().Set("Cache-Control", "private, max-age=60")
+	w.Header().Set("Accept-Ranges", "none")
 	_, _ = io.Copy(w, rc)
 }
 

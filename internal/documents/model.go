@@ -24,16 +24,19 @@ const (
 )
 
 type DuplicateMatch struct {
-	ID         uuid.UUID  `json:"id"`
-	Title      string     `json:"title"`
-	ERP        string     `json:"erp"`
-	Client     string     `json:"client,omitempty"`
-	Member     string     `json:"member,omitempty"`
-	Score      float64    `json:"score"`
-	Uploaded   time.Time  `json:"uploaded_at"`
-	FileURL    string     `json:"file_url,omitempty"`
-	Kind       string     `json:"kind,omitempty"`
-	Uniqueness Uniqueness `json:"uniqueness,omitempty"`
+	ID          uuid.UUID  `json:"id"`
+	SourceID    uuid.UUID  `json:"source_id,omitempty"`
+	DocumentID  uuid.UUID  `json:"document_id,omitempty"`
+	Title       string     `json:"title"`
+	ERP         string     `json:"erp"`
+	Client      string     `json:"client,omitempty"`
+	Member      string     `json:"member,omitempty"`
+	Score       float64    `json:"score"`
+	Uploaded    time.Time  `json:"uploaded_at"`
+	FileURL     string     `json:"file_url,omitempty"`
+	ContentType string     `json:"content_type,omitempty"`
+	Kind        string     `json:"kind,omitempty"`
+	Uniqueness  Uniqueness `json:"uniqueness,omitempty"`
 }
 
 type HashMatch struct {

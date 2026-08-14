@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +46,32 @@ func main() {
 	if err != nil {
 		log.Error("storage", "err", err)
 		os.Exit(1)
+	}
+	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
+	if store.Driver() != "r2" {
+		if hosted {
+			log.Error("hosted storage must be r2")
+			os.Exit(1)
+		}
+		log.Warn("storage is local disk; uploads will not persist across deploys")
+	} else {
+		readyCtx, readyCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		if err := store.Ready(readyCtx); err != nil {
+			readyCancel()
+			log.Error("r2 not ready", "err", err)
+			os.Exit(1)
+		}
+		readyCancel()
+		if r2, ok := store.(*blob.R2); ok {
+			importCtx, importCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			n, err := r2.ImportDir(importCtx, cfg.StorageDir)
+			importCancel()
+			if err != nil {
+				log.Warn("import local files to r2", "err", err)
+			} else if n > 0 {
+				log.Info("imported local files to r2", "count", n)
+			}
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

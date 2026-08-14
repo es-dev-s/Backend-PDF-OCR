@@ -76,19 +76,29 @@ func Load() (Config, error) {
 	if cfg.Heartbeat < time.Second {
 		cfg.Heartbeat = 2 * time.Second
 	}
-	if cfg.StorageDriver == "" {
-		cfg.StorageDriver = "local"
+
+	r2OK := cfg.R2AccountID != "" && cfg.R2AccessKey != "" && cfg.R2Secret != "" && cfg.R2Bucket != ""
+	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
+	driver, err := pickStorage(cfg.StorageDriver, r2OK, hosted)
+	if err != nil {
+		return cfg, err
 	}
-	if strings.EqualFold(cfg.StorageDriver, "r2") || strings.EqualFold(cfg.StorageDriver, "s3") {
-		cfg.StorageDriver = "r2"
-		if cfg.R2AccountID == "" || cfg.R2AccessKey == "" || cfg.R2Secret == "" || cfg.R2Bucket == "" {
-			return cfg, fmt.Errorf("R2 storage requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET")
-		}
-	}
+	cfg.StorageDriver = driver
 	if cfg.HTTPAddr == "" {
 		return cfg, fmt.Errorf("HTTP_ADDR is required")
 	}
 	return cfg, nil
+}
+
+func pickStorage(driver string, r2OK, hosted bool) (string, error) {
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	if r2OK {
+		return "r2", nil
+	}
+	if hosted || driver == "r2" || driver == "s3" {
+		return "", fmt.Errorf("R2 storage requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET")
+	}
+	return "local", nil
 }
 
 func env(key, fallback string) string {

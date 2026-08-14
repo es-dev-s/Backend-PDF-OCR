@@ -311,6 +311,69 @@ func mapR2GetErr(err error) error {
 	return fmt.Errorf("r2 get: %w", err)
 }
 
+func (r *R2) hasObject(ctx context.Context, key string) (bool, error) {
+	obj, err := r.objectKey(key)
+	if err != nil {
+		return false, err
+	}
+	_, err = r.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(obj),
+	})
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(mapR2GetErr(err), ErrNotFound) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (r *R2) ImportDir(ctx context.Context, root string) (int, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return 0, nil
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		return 0, nil
+	}
+	copied := 0
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		key := filepath.ToSlash(rel)
+		exists, err := r.hasObject(ctx, key)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		st, _ := f.Stat()
+		putErr := r.Put(ctx, key, f, st.Size(), contentTypeFor(key))
+		_ = f.Close()
+		if putErr != nil {
+			return putErr
+		}
+		copied++
+		return nil
+	})
+	return copied, err
+}
+
 func (r *R2) Delete(ctx context.Context, key string) error {
 	obj, err := r.objectKey(key)
 	if err != nil {

@@ -21,7 +21,11 @@ type R2Options struct {
 }
 
 func New(opts Options) (Store, error) {
-	switch strings.ToLower(strings.TrimSpace(opts.Driver)) {
+	driver := strings.ToLower(strings.TrimSpace(opts.Driver))
+	if r2Ready(opts.R2) && (driver == "" || driver == "local") {
+		driver = "r2"
+	}
+	switch driver {
 	case "r2", "s3":
 		return NewR2(opts.R2)
 	case "", "local":
@@ -29,4 +33,11 @@ func New(opts Options) (Store, error) {
 	default:
 		return nil, fmt.Errorf("unknown storage driver %q", opts.Driver)
 	}
+}
+
+func r2Ready(opts R2Options) bool {
+	return strings.TrimSpace(opts.AccountID) != "" &&
+		strings.TrimSpace(opts.AccessKey) != "" &&
+		strings.TrimSpace(opts.Secret) != "" &&
+		strings.TrimSpace(opts.Bucket) != ""
 }

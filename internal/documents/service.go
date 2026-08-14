@@ -209,7 +209,7 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 		_ = f.Close()
 		return nil, 0, "", "", time.Time{}, ErrNotFound
 	}
-	if src.SizeBytes > 0 && info.Size() != src.SizeBytes {
+	if src.SizeBytes > 0 && info.Size() != src.SizeBytes && s.blob.Driver() == "r2" {
 		_ = f.Close()
 		_ = os.Remove(path)
 		path, err = s.blob.LocalPath(ctx, src.StorageKey)

@@ -53,10 +53,10 @@ func Load() (Config, error) {
 		CORSOrigins:        splitCSV(env("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")),
 		MaxUploadBytes:     envInt64("MAX_UPLOAD_BYTES", 50<<20),
 		MaxSources:         int(envInt64("MAX_SOURCES", 4)),
-		WorkerN:            int(envInt64("WORKER_CONCURRENCY", 16)),
-		PGMaxConns:         int32(envInt64("PG_MAX_CONNS", 16)),
-		RedisPoolSize:      int(envInt64("REDIS_POOL_SIZE", 16)),
-		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 32)),
+		WorkerN:            capWorkers(int(envInt64("WORKER_CONCURRENCY", 2)), hosted()),
+		PGMaxConns:         int32(envInt64("PG_MAX_CONNS", 8)),
+		RedisPoolSize:      int(envInt64("REDIS_POOL_SIZE", 8)),
+		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 4)),
 		Heartbeat:          time.Duration(envInt64("HEARTBEAT_SECONDS", 2)) * time.Second,
 		ShutdownTimeout:    time.Duration(envInt64("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 		EngineURL:          env("ENGINE_BASE_URL", "http://127.0.0.1:8000"),
@@ -68,7 +68,18 @@ func Load() (Config, error) {
 		cfg.MaxSources = 4
 	}
 	if cfg.MaxInflightUploads < 1 {
-		cfg.MaxInflightUploads = 32
+		cfg.MaxInflightUploads = 4
+	}
+	if hosted() {
+		if cfg.PGMaxConns > 8 {
+			cfg.PGMaxConns = 8
+		}
+		if cfg.RedisPoolSize > 8 {
+			cfg.RedisPoolSize = 8
+		}
+		if cfg.MaxInflightUploads > 4 {
+			cfg.MaxInflightUploads = 4
+		}
 	}
 	if cfg.PGMaxConns < 4 {
 		cfg.PGMaxConns = 8
@@ -78,8 +89,7 @@ func Load() (Config, error) {
 	}
 
 	r2OK := cfg.R2AccountID != "" && cfg.R2AccessKey != "" && cfg.R2Secret != "" && cfg.R2Bucket != ""
-	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
-	driver, err := pickStorage(cfg.StorageDriver, r2OK, hosted)
+	driver, err := pickStorage(cfg.StorageDriver, r2OK, hosted())
 	if err != nil {
 		return cfg, err
 	}
@@ -106,6 +116,24 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func hosted() bool {
+	return strings.TrimSpace(os.Getenv("PORT")) != ""
+}
+
+func capWorkers(n int, hosted bool) int {
+	if n < 1 {
+		n = 2
+	}
+	max := 4
+	if hosted {
+		max = 2
+	}
+	if n > max {
+		return max
+	}
+	return n
 }
 
 func listenAddr() string {

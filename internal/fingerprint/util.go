@@ -17,8 +17,10 @@ const (
 	MinRunesPerPage  = 80
 	SimHashMaxDist   = 1
 	PHashMaxDist     = 1
-	MaxTextPages     = 20
-	MaxVisualPages   = 3
+	MaxTextPages     = 8
+	MaxTextBytes     = 128 << 10
+	MaxVisualPages   = 1
+	MaxImagePixels   = 2_000_000
 	LSHBands         = 4
 	MinExactScore    = 99.9
 	MinTextNearScore = 98.0

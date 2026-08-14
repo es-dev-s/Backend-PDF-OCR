@@ -17,6 +17,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const MaxTitleBytes = 2 << 20
+
 type Result struct {
 	OK          bool   `json:"ok"`
 	Title       string `json:"title,omitempty"`
@@ -46,7 +48,7 @@ func New(base string, log *slog.Logger) *Client {
 	return &Client{
 		base: base,
 		http: &http.Client{Timeout: 0},
-		sem:  make(chan struct{}, 2),
+		sem:  make(chan struct{}, 1),
 		log:  log,
 	}
 }
@@ -98,7 +100,8 @@ func (c *Client) Title(ctx context.Context, filename string, r io.Reader) (Resul
 		return out, fmt.Errorf("engine is not configured")
 	}
 	var payload bytes.Buffer
-	if _, err := io.Copy(&payload, io.LimitReader(r, 50<<20)); err != nil {
+	payload.Grow(MaxTitleBytes + 64)
+	if _, err := io.Copy(&payload, io.LimitReader(r, MaxTitleBytes)); err != nil {
 		return out, err
 	}
 	select {
@@ -142,6 +145,7 @@ func (c *Client) Title(ctx context.Context, filename string, r io.Reader) (Resul
 func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (Result, time.Duration, error) {
 	var out Result
 	var buf bytes.Buffer
+	buf.Grow(MaxTitleBytes + 4096)
 	mw := multipart.NewWriter(&buf)
 	part, err := mw.CreateFormFile("file", filename)
 	if err != nil {

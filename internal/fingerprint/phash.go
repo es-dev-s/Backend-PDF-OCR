@@ -28,6 +28,19 @@ func PerceptionHashFile(path string) (uint64, error) {
 		return 0, err
 	}
 	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return 0, err
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, image.ErrFormat
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > MaxImagePixels {
+		return 0, image.ErrFormat
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return 0, err
+	}
 	img, _, err := image.Decode(f)
 	if err != nil {
 		return 0, err

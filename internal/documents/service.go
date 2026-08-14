@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type Service struct {
 	maxB    int64
 	inspect chan struct{}
 	hashing sync.Map
+	heavy   chan struct{}
 }
 
 func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Pool, notes Notifier, eng *engine.Client, log *slog.Logger, maxSources int, maxBytes int64) *Service {
@@ -59,7 +61,8 @@ func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Po
 		log:     log,
 		maxN:    maxSources,
 		maxB:    maxBytes,
-		inspect: make(chan struct{}, 2),
+		inspect: make(chan struct{}, 1),
+		heavy:   make(chan struct{}, 1),
 	}
 }
 
@@ -243,7 +246,7 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 }
 
 func (s *Service) RecoverPending(ctx context.Context) {
-	sources, err := s.repo.ListUnhashed(ctx, 100)
+	sources, err := s.repo.ListUnhashed(ctx, 4)
 	if err != nil {
 		if !errors.Is(err, ErrUnavailable) {
 			s.log.Warn("recover pending failed", "err", err)
@@ -258,8 +261,20 @@ func (s *Service) RecoverPending(ctx context.Context) {
 }
 
 func (s *Service) RunRecovery(ctx context.Context) {
+	wait := time.NewTicker(400 * time.Millisecond)
+	defer wait.Stop()
+	for {
+		if _, err := s.repo.ListUnhashed(ctx, 1); err == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-wait.C:
+		}
+	}
 	s.RecoverPending(ctx)
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(45 * time.Second)
 	defer t.Stop()
 	for {
 		select {
@@ -274,7 +289,7 @@ func (s *Service) RunRecovery(ctx context.Context) {
 func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*multipart.FileHeader, titles []string, now time.Time) ([]Source, error) {
 	out := make([]Source, len(files))
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(4)
+	g.SetLimit(2)
 	var mu sync.Mutex
 	for i, fh := range files {
 		i, fh := i, fh
@@ -403,6 +418,11 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 		out.OK = false
 		return out
 	}
+	if !s.acquireHeavy(ctx) {
+		out.OK = false
+		return out
+	}
+	defer s.releaseHeavy()
 	path, err := writeInspectTemp(r, filename, s.maxB)
 	if err != nil {
 		s.log.Warn("inspect temp failed", "err", err, "file", filename)
@@ -473,6 +493,10 @@ func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader
 	if s.engine == nil || !s.engine.Configured() {
 		return out
 	}
+	if !s.acquireHeavy(ctx) {
+		return out
+	}
+	defer s.releaseHeavy()
 	head := make([]byte, 16)
 	n, _ := io.ReadFull(r, head)
 	if n > 0 {
@@ -497,6 +521,10 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 	if s.engine == nil || !s.engine.Configured() {
 		return
 	}
+	if !s.acquireHeavy(ctx) {
+		return
+	}
+	defer s.releaseHeavy()
 	err := retry.Do(ctx, 4, func(ctx context.Context) error {
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
 		if err != nil {
@@ -538,6 +566,11 @@ func (s *Service) hashSource(ctx context.Context, src Source) {
 		return
 	}
 	defer s.hashing.Delete(key)
+
+	if !s.acquireHeavy(ctx) {
+		return
+	}
+	defer s.releaseHeavy()
 
 	err := retry.Do(ctx, 8, func(ctx context.Context) error {
 		meta, err := s.repo.SourceMeta(ctx, src.DocumentID, src.ID)
@@ -640,6 +673,25 @@ func (l *limitErrReader) Read(p []byte) (int, error) {
 		return n, fmt.Errorf("file too large")
 	}
 	return n, err
+}
+
+func (s *Service) acquireHeavy(ctx context.Context) bool {
+	if s.heavy == nil {
+		return true
+	}
+	select {
+	case s.heavy <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Service) releaseHeavy() {
+	if s.heavy != nil {
+		<-s.heavy
+	}
+	debug.FreeOSMemory()
 }
 
 func sanitizeName(name string) string {

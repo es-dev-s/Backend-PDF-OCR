@@ -3,20 +3,76 @@ package fingerprint
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ledongthuc/pdf"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 func ExtractPDFText(path string) (text string, pages int, err error) {
+	if text, pages, err = extractPDFTextPoppler(path); err == nil {
+		return capText(text), pages, nil
+	}
+	info, statErr := os.Stat(path)
+	if statErr == nil && info.Size() > 8<<20 {
+		return "", 0, nil
+	}
+	text, pages, err = extractPDFTextGo(path)
+	if err != nil {
+		return "", pages, err
+	}
+	return capText(text), pages, nil
+}
+
+func extractPDFTextPoppler(path string) (string, int, error) {
+	bin, err := exec.LookPath("pdftotext")
+	if err != nil {
+		return "", 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-f", "1", "-l", strconv.Itoa(MaxTextPages), "-enc", "UTF-8", "-q", path, "-")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", 0, err
+	}
+	return string(out), pdfPageCount(path), nil
+}
+
+func pdfPageCount(path string) int {
+	bin, err := exec.LookPath("pdfinfo")
+	if err != nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-q", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "Pages:") {
+			continue
+		}
+		n, convErr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Pages:")))
+		if convErr == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func extractPDFTextGo(path string) (text string, pages int, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("pdf parse panic: %v", rec)
+		}
+	}()
 	f, r, err := pdf.Open(path)
 	if err != nil {
 		return "", 0, err
@@ -29,6 +85,9 @@ func ExtractPDFText(path string) (text string, pages int, err error) {
 		limit = MaxTextPages
 	}
 	for i := 1; i <= limit; i++ {
+		if b.Len() >= MaxTextBytes {
+			break
+		}
 		p := r.Page(i)
 		if p.V.IsNull() {
 			continue
@@ -43,77 +102,11 @@ func ExtractPDFText(path string) (text string, pages int, err error) {
 	return b.String(), pages, nil
 }
 
-func ExtractPDFPageImages(path string) (files []string, cleanup func(), err error) {
-	if _, lookErr := exec.LookPath("pdftoppm"); lookErr == nil {
-		files, cleanup, err = renderPDFPages(path)
-		if err == nil {
-			return files, cleanup, nil
-		}
+func capText(s string) string {
+	if len(s) <= MaxTextBytes {
+		return s
 	}
-	return extractEmbeddedImages(path)
-}
-
-func renderPDFPages(path string) (files []string, cleanup func(), err error) {
-	bin, err := exec.LookPath("pdftoppm")
-	if err != nil {
-		return nil, func() {}, err
-	}
-	dir, err := os.MkdirTemp("", "ocr-fp-render-*")
-	if err != nil {
-		return nil, func() {}, err
-	}
-	cleanup = func() { _ = os.RemoveAll(dir) }
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	prefix := filepath.Join(dir, "page")
-	cmd := exec.CommandContext(ctx, bin, "-png", "-f", "1", "-l", strconv.Itoa(MaxVisualPages), "-r", "72", path, prefix)
-	if err := cmd.Run(); err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	files, err = listImages(dir)
-	if err != nil || len(files) == 0 {
-		cleanup()
-		return nil, func() {}, err
-	}
-	return files, cleanup, nil
-}
-
-func extractEmbeddedImages(path string) (files []string, cleanup func(), err error) {
-	dir, err := os.MkdirTemp("", "ocr-fp-*")
-	if err != nil {
-		return nil, func() {}, err
-	}
-	cleanup = func() { _ = os.RemoveAll(dir) }
-	conf := model.NewDefaultConfiguration()
-	conf.ValidationMode = model.ValidationRelaxed
-	pages := []string{"1-" + strconv.Itoa(MaxVisualPages)}
-	if err := api.ExtractImagesFile(path, dir, pages, conf); err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	files, err = listImages(dir)
-	if err != nil {
-		cleanup()
-		return nil, func() {}, err
-	}
-	return files, cleanup, nil
-}
-
-func listImages(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	files := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !IsImageName(e.Name()) {
-			continue
-		}
-		files = append(files, filepath.Join(dir, e.Name()))
-	}
-	sort.Strings(files)
-	return files, nil
+	return s[:MaxTextBytes]
 }
 
 func ValidPDF(path string) bool {

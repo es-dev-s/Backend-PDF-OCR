@@ -16,6 +16,7 @@ import (
 	"ocr-backend/internal/documents"
 	"ocr-backend/internal/engine"
 	"ocr-backend/internal/httpapi"
+	"ocr-backend/internal/memlimit"
 	"ocr-backend/internal/notifications"
 	"ocr-backend/internal/postgres"
 	"ocr-backend/internal/realtime"
@@ -25,6 +26,8 @@ import (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
+	mem := memlimit.Apply(hosted)
 	cfg, err := config.Load()
 	if err != nil {
 		log.Error("config", "err", err)
@@ -47,7 +50,6 @@ func main() {
 		log.Error("storage", "err", err)
 		os.Exit(1)
 	}
-	hosted := strings.TrimSpace(os.Getenv("PORT")) != ""
 	if store.Driver() != "r2" {
 		if hosted {
 			log.Error("hosted storage must be r2")
@@ -62,16 +64,6 @@ func main() {
 			os.Exit(1)
 		}
 		readyCancel()
-		if r2, ok := store.(*blob.R2); ok {
-			importCtx, importCancel := context.WithTimeout(context.Background(), 3*time.Minute)
-			n, err := r2.ImportDir(importCtx, cfg.StorageDir)
-			importCancel()
-			if err != nil {
-				log.Warn("import local files to r2", "err", err)
-			} else if n > 0 {
-				log.Info("imported local files to r2", "count", n)
-			}
-		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -104,12 +96,25 @@ func main() {
 	}
 
 	go func() {
-		log.Info("listening", "addr", cfg.HTTPAddr, "storage", store.Driver(), "prefix", cfg.R2Prefix)
+		log.Info("listening", "addr", cfg.HTTPAddr, "storage", store.Driver(), "prefix", cfg.R2Prefix, "workers", cfg.WorkerN, "memlimit", mem)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server", "err", err)
 			stop()
 		}
 	}()
+
+	if r2, ok := store.(*blob.R2); ok {
+		go func() {
+			importCtx, importCancel := context.WithTimeout(ctx, 3*time.Minute)
+			defer importCancel()
+			n, err := r2.ImportDir(importCtx, cfg.StorageDir)
+			if err != nil {
+				log.Warn("import local files to r2", "err", err)
+			} else if n > 0 {
+				log.Info("imported local files to r2", "count", n)
+			}
+		}()
+	}
 
 	<-ctx.Done()
 	log.Info("shutting down")

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -63,8 +64,8 @@ func NewR2(opts R2Options) (*R2, error) {
 			Timeout: 0,
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
-				MaxIdleConns:          64,
-				MaxIdleConnsPerHost:   16,
+				MaxIdleConns:          8,
+				MaxIdleConnsPerHost:   4,
 				IdleConnTimeout:       90 * time.Second,
 				TLSHandshakeTimeout:   5 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
@@ -190,6 +191,7 @@ func (r *R2) Put(ctx context.Context, key string, reader io.Reader, _ int64, con
 		return err
 	}
 	ok = true
+	r.trimCache()
 	return nil
 }
 
@@ -279,6 +281,7 @@ func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
 		return "", err
 	}
 	ok = true
+	r.trimCache()
 	return cache, nil
 }
 
@@ -462,4 +465,47 @@ func (r *R2) cachePath(objKey string) string {
 		ext = ""
 	}
 	return filepath.Join(r.cacheDir, hex.EncodeToString(sum[:])+ext)
+}
+
+const maxCacheBytes int64 = 64 << 20
+
+func (r *R2) trimCache() {
+	type item struct {
+		path string
+		size int64
+		mod  time.Time
+	}
+	var files []item
+	var total int64
+	_ = filepath.WalkDir(r.cacheDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		files = append(files, item{path: path, size: info.Size(), mod: info.ModTime()})
+		total += info.Size()
+		return nil
+	})
+	if total <= maxCacheBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+	want := maxCacheBytes * 3 / 4
+	for _, f := range files {
+		if total <= want {
+			return
+		}
+		if time.Since(f.mod) < 30*time.Second {
+			continue
+		}
+		if os.Remove(f.path) == nil {
+			total -= f.size
+		}
+	}
 }

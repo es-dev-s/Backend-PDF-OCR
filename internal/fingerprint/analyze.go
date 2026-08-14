@@ -73,23 +73,10 @@ func analyzePDF(path string, out *Result) {
 			sum := sha256.Sum256([]byte(norm))
 			out.TextNormSHA = hex.EncodeToString(sum[:])
 			out.SimHash = SimHash64(tokens)
-			return
 		}
 	}
-	files, cleanup, err := ExtractPDFPageImages(path)
-	if err != nil {
-		return
-	}
-	defer cleanup()
-	if len(files) == 0 {
-		return
-	}
-	h, err := PerceptionHashFile(files[0])
-	if err != nil {
-		return
-	}
-	out.PHash = h
-	out.HasVisual = true
+	// Do not rasterize PDFs. pdftoppm/pdfcpu can exceed a small Railway cgroup
+	// and uniqueness still matches identical files via SHA-256.
 }
 
 func textIsSubstantial(runes, tokens, pages int) bool {

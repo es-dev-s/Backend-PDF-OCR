@@ -108,7 +108,7 @@ func (c *Client) watch(ctx context.Context) {
 			if rdb == nil {
 				return
 			}
-			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := rdb.Ping(pingCtx).Err()
 			if err == nil {
 				_ = rdb.Set(pingCtx, "ocr:api:heartbeat", time.Now().UTC().Format(time.RFC3339Nano), 20*time.Second).Err()
@@ -117,7 +117,7 @@ func (c *Client) watch(ctx context.Context) {
 			if err != nil {
 				fails++
 				c.log.Warn("redis ping failed", "err", err, "fails", fails)
-				if fails >= 3 {
+				if fails >= 8 {
 					c.set(nil, err)
 					return
 				}

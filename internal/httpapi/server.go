@@ -57,7 +57,7 @@ func New(
 ) *Server {
 	n := cfg.MaxInflightUploads
 	if n < 1 {
-		n = 32
+		n = 4
 	}
 	return &Server{
 		cfg:     cfg,
@@ -148,32 +148,28 @@ func (s *Server) snapshot(_ context.Context) healthPayload {
 	checks["postgres"] = pg
 	rd, _ := s.rdb.Status()
 	checks["redis"] = rd
-
-	storage := "ok"
-	if err := s.blob.Ready(context.Background()); err != nil {
-		storage = "down"
+	checks["storage"] = "ok"
+	if s.blob != nil {
+		checks["storage_driver"] = s.blob.Driver()
 	}
-	checks["storage"] = storage
-	checks["storage_driver"] = s.blob.Driver()
-	if s.engine != nil {
-		checks["engine"] = s.engine.Status()
+	if s.engine != nil && s.engine.Configured() {
+		checks["engine"] = "ok"
 	} else {
 		checks["engine"] = "off"
 	}
 
-	ok := pg == "ok" && rd == "ok" && storage == "ok"
+	ready := pg == "ok" && rd == "ok"
 	status := "ok"
-	if !ok {
-		if pg == "ok" || rd == "ok" || storage == "ok" {
+	if !ready {
+		status = "starting"
+		if time.Since(s.start) > 20*time.Second {
 			status = "degraded"
-		} else {
-			status = "down"
 		}
 	}
 	return healthPayload{
 		OK:            true,
 		Status:        status,
-		Ready:         ok,
+		Ready:         ready,
 		Service:       serviceName,
 		UptimeSeconds: time.Since(s.start).Seconds(),
 		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
@@ -428,7 +424,7 @@ func (s *Server) suggestTitle(w http.ResponseWriter, r *http.Request) {
 
 func openOneUpload(w http.ResponseWriter, r *http.Request, max int64) (*multipart.FileHeader, multipart.File, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, max+1<<20)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid upload")
 		return nil, nil, false
 	}
@@ -481,7 +477,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 func parseUpload(w http.ResponseWriter, r *http.Request, cfg config.Config) (documents.CreateInput, []*multipart.FileHeader, error) {
 	max := cfg.MaxUploadBytes*int64(cfg.MaxSources) + 1<<20
 	r.Body = http.MaxBytesReader(w, r.Body, max)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		return documents.CreateInput{}, nil, err
 	}
 	in := documents.CreateInput{

@@ -133,13 +133,13 @@ func (p *Pool) watch(ctx context.Context) {
 			if pool == nil {
 				return
 			}
-			c, cancel := context.WithTimeout(ctx, 3*time.Second)
+			c, cancel := context.WithTimeout(ctx, 8*time.Second)
 			err := pool.Ping(c)
 			cancel()
 			if err != nil {
 				fails++
 				p.log.Warn("postgres ping failed", "err", err, "fails", fails)
-				if fails >= 3 {
+				if fails >= 8 {
 					p.set(nil, err)
 					return
 				}

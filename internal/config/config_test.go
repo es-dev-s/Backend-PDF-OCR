@@ -36,3 +36,18 @@ func TestPickStorage(t *testing.T) {
 		})
 	}
 }
+
+func TestCapWorkers(t *testing.T) {
+	if got := capWorkers(16, true); got != 2 {
+		t.Fatalf("hosted 16 -> %d want 2", got)
+	}
+	if got := capWorkers(1, true); got != 1 {
+		t.Fatalf("hosted 1 -> %d want 1", got)
+	}
+	if got := capWorkers(16, false); got != 4 {
+		t.Fatalf("local 16 -> %d want 4", got)
+	}
+	if got := capWorkers(0, false); got != 2 {
+		t.Fatalf("zero -> %d want 2", got)
+	}
+}

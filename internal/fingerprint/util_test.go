@@ -94,3 +94,14 @@ func TestMissingHashIsStableAndUnique(t *testing.T) {
 		t.Fatal("missing hashes must not collide across sources")
 	}
 }
+
+func TestCapText(t *testing.T) {
+	if got := capText("abc"); got != "abc" {
+		t.Fatalf("short text changed: %q", got)
+	}
+	long := strings.Repeat("x", MaxTextBytes+80)
+	got := capText(long)
+	if len(got) != MaxTextBytes {
+		t.Fatalf("len=%d want %d", len(got), MaxTextBytes)
+	}
+}

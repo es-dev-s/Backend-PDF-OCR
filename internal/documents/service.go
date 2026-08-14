@@ -42,6 +42,7 @@ type Service struct {
 	maxN    int
 	maxB    int64
 	inspect chan struct{}
+	hashing sync.Map
 }
 
 func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Pool, notes Notifier, eng *engine.Client, log *slog.Logger, maxSources int, maxBytes int64) *Service {
@@ -314,6 +315,9 @@ func (s *Service) hashSources(ctx context.Context, sources []Source) {
 func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
 	for _, src := range sources {
 		src := src
+		if _, loaded := s.hashing.Load(src.ID.String()); loaded {
+			continue
+		}
 		if err := s.pool.Submit(ctx, func(jobCtx context.Context) {
 			s.hashSource(jobCtx, src)
 		}); err != nil {
@@ -483,7 +487,20 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 }
 
 func (s *Service) hashSource(ctx context.Context, src Source) {
+	key := src.ID.String()
+	if _, loaded := s.hashing.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	defer s.hashing.Delete(key)
+
 	err := retry.Do(ctx, 8, func(ctx context.Context) error {
+		meta, err := s.repo.SourceMeta(ctx, src.DocumentID, src.ID)
+		if err != nil {
+			return err
+		}
+		if meta.SHA256 != nil && *meta.SHA256 != "" {
+			return nil
+		}
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
 		if err != nil {
 			return err

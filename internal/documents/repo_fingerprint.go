@@ -3,8 +3,8 @@ package documents
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,22 +17,40 @@ type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
+func fingerprintLockKeys(fp fingerprint.Result) []string {
+	keys := make([]string, 0, 10)
+	if fp.SHA256 != "" {
+		keys = append(keys, "sha:"+fp.SHA256)
+	}
+	if fp.TextNormSHA != "" {
+		keys = append(keys, "txt:"+fp.TextNormSHA)
+	}
+	addBands := func(kind string, hash uint64) {
+		if hash == 0 {
+			return
+		}
+		bands := fingerprint.Bands(hash)
+		for i, bucket := range bands {
+			keys = append(keys, fmt.Sprintf("lsh:%s:%d:%d", kind, i, bucket))
+		}
+	}
+	if fp.HasText {
+		addBands("simhash", fp.SimHash)
+	} else if fp.HasVisual {
+		addBands("phash", fp.PHash)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerprint.Result) (FinalizeResult, error) {
 	var out FinalizeResult
 	err := r.withTx(ctx, func(tx pgx.Tx) error {
 		if fp.SHA256 == "" {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "sha:"+fp.SHA256); err != nil {
-			return err
-		}
-		if fp.SimHash != 0 {
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "sim:"+u64(fp.SimHash)); err != nil {
-				return err
-			}
-		}
-		if fp.PHash != 0 {
-			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "ph:"+u64(fp.PHash)); err != nil {
+		for _, key := range fingerprintLockKeys(fp) {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, key); err != nil {
 				return err
 			}
 		}
@@ -89,11 +107,20 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 			lockRows.Close()
 		}
 
-		if err := tx.QueryRow(ctx, `SELECT document_id FROM sources WHERE id=$1 FOR UPDATE`, src.ID).Scan(&docID); err != nil {
+		var hashed *string
+		var existing Uniqueness
+		if err := tx.QueryRow(ctx, `
+			SELECT document_id, content_sha256, uniqueness
+			FROM sources WHERE id=$1 FOR UPDATE`, src.ID).
+			Scan(&docID, &hashed, &existing); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrNotFound
 			}
 			return err
+		}
+		if hashed != nil && *hashed != "" {
+			out.Uniqueness = existing
+			return nil
 		}
 
 		matches, err = livingMatches(ctx, tx, matches)
@@ -453,10 +480,6 @@ func nullI64(v uint64) any {
 		return nil
 	}
 	return int64(v)
-}
-
-func u64(v uint64) string {
-	return strconv.FormatUint(v, 10)
 }
 
 func uploadedFirst(aID uuid.UUID, aTime time.Time, bID uuid.UUID, bTime time.Time) bool {

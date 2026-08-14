@@ -22,14 +22,16 @@ import (
 )
 
 type R2 struct {
-	bucket   string
-	prefix   string
-	client   *s3.Client
-	uploader *manager.Uploader
-	cacheDir string
-	mu       sync.Mutex
-	readyAt  time.Time
-	readyErr error
+	bucket     string
+	prefix     string
+	client     *s3.Client
+	uploader   *manager.Uploader
+	cacheDir   string
+	mu         sync.Mutex
+	readyAt    time.Time
+	readyErr   error
+	cacheMu    sync.Mutex
+	cacheLocks map[string]*sync.Mutex
 }
 
 func NewR2(opts R2Options) (*R2, error) {
@@ -88,8 +90,21 @@ func NewR2(opts R2Options) (*R2, error) {
 			u.Concurrency = 1
 			u.LeavePartsOnError = false
 		}),
-		cacheDir: cacheDir,
+		cacheDir:   cacheDir,
+		cacheLocks: make(map[string]*sync.Mutex),
 	}, nil
+}
+
+func (r *R2) lockCache(path string) func() {
+	r.cacheMu.Lock()
+	m := r.cacheLocks[path]
+	if m == nil {
+		m = &sync.Mutex{}
+		r.cacheLocks[path] = m
+	}
+	r.cacheMu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 func (r *R2) Driver() string { return "r2" }
@@ -128,6 +143,8 @@ func (r *R2) Put(ctx context.Context, key string, reader io.Reader, _ int64, con
 		contentType = contentTypeFor(key)
 	}
 	cache := r.cachePath(obj)
+	unlock := r.lockCache(cache)
+	defer unlock()
 	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
 		return err
 	}
@@ -209,6 +226,8 @@ func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
 		return "", err
 	}
 	cache := r.cachePath(obj)
+	unlock := r.lockCache(cache)
+	defer unlock()
 	if info, err := os.Stat(cache); err == nil && info.Size() > 0 {
 		return cache, nil
 	}
@@ -258,11 +277,14 @@ func (r *R2) Delete(ctx context.Context, key string) error {
 		ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
 	}
+	cache := r.cachePath(obj)
+	unlock := r.lockCache(cache)
+	defer unlock()
 	_, err = r.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(r.bucket),
 		Key:    aws.String(obj),
 	})
-	_ = os.Remove(r.cachePath(obj))
+	_ = os.Remove(cache)
 	if err != nil {
 		return fmt.Errorf("r2 delete: %w", err)
 	}

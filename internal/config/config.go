@@ -33,7 +33,7 @@ func Load() (Config, error) {
 	_ = godotenv.Load(".env")
 
 	cfg := Config{
-		HTTPAddr:           env("HTTP_ADDR", "127.0.0.1:8001"),
+		HTTPAddr:           listenAddr(),
 		DatabaseURL:        strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		RedisURL:           strings.TrimSpace(os.Getenv("REDIS_URL")),
 		StorageDriver:      env("STORAGE_DRIVER", "local"),
@@ -78,6 +78,13 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func listenAddr() string {
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		return "0.0.0.0:" + port
+	}
+	return env("HTTP_ADDR", "127.0.0.1:8001")
 }
 
 func envInt64(key string, fallback int64) int64 {

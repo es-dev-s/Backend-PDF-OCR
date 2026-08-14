@@ -101,6 +101,9 @@ func (l *Local) Open(_ context.Context, key string) (io.ReadCloser, int64, strin
 	}
 	f, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, "", ErrNotFound
+		}
 		return nil, 0, "", err
 	}
 	info, err := f.Stat()

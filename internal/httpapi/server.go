@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"mime/multipart"
 	"net/http"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 		r.Delete("/documents/{id}", s.deleteDocument)
 		r.Post("/documents/{id}/sources", s.addSources)
 		r.Get("/documents/{id}/sources/{sid}/file", s.getFile)
+		r.Head("/documents/{id}/sources/{sid}/file", s.getFile)
 		r.Post("/engine/title", s.suggestTitle)
 		r.Get("/notifications", s.listNotifications)
 		r.Patch("/notifications/{id}/read", s.markRead)
@@ -361,18 +362,19 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid id")
 		return
 	}
-	rc, size, ctype, name, err := s.docs.OpenFile(r.Context(), docID, sid)
+	f, _, ctype, name, mod, err := s.docs.OpenFile(r.Context(), docID, sid)
 	if err != nil {
 		s.writeErr(w, err)
 		return
 	}
-	defer rc.Close()
-	w.Header().Set("Content-Type", ctype)
-	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, name))
-	w.Header().Set("Cache-Control", "private, max-age=60")
-	w.Header().Set("Accept-Ranges", "none")
-	_, _ = io.Copy(w, rc)
+	defer f.Close()
+	if ctype != "" {
+		w.Header().Set("Content-Type", ctype)
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename=%q`, safeDownloadName(name, ctype)))
+	w.Header().Set("Cache-Control", "private, max-age=120")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, name, mod, f)
 }
 
 func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
@@ -460,7 +462,7 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, documents.ErrUnavailable):
 		writeErrCode(w, http.StatusServiceUnavailable, "unavailable", "postgres is unavailable")
-	case errors.Is(err, documents.ErrNotFound):
+	case errors.Is(err, documents.ErrNotFound), errors.Is(err, blob.ErrNotFound):
 		writeErrCode(w, http.StatusNotFound, "not_found", "not found")
 	case errors.Is(err, documents.ErrERPTaken):
 		writeErrCode(w, http.StatusConflict, "erp_taken", "ERP code is already in use")
@@ -502,6 +504,25 @@ func parseUpload(w http.ResponseWriter, r *http.Request, cfg config.Config) (doc
 
 func parseID(raw string) (uuid.UUID, error) {
 	return uuid.Parse(strings.TrimSpace(raw))
+}
+
+func safeDownloadName(name, ctype string) string {
+	base := filepath.Base(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+	var b strings.Builder
+	for _, r := range base {
+		if r < 32 || r == '"' || unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" || out == "." || out == ".." {
+		out = "document"
+	}
+	if filepath.Ext(out) == "" && strings.Contains(strings.ToLower(ctype), "pdf") {
+		out += ".pdf"
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

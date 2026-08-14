@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -197,17 +198,19 @@ func (r *R2) Open(ctx context.Context, key string) (io.ReadCloser, int64, string
 	if err != nil {
 		return nil, 0, "", err
 	}
+	var cancel context.CancelFunc
 	if _, has := ctx.Deadline(); !has {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
-		defer cancel()
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Minute)
 	}
 	out, err := r.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(r.bucket),
 		Key:    aws.String(obj),
 	})
 	if err != nil {
-		return nil, 0, "", fmt.Errorf("r2 get: %w", err)
+		if cancel != nil {
+			cancel()
+		}
+		return nil, 0, "", mapR2GetErr(err)
 	}
 	size := int64(0)
 	if out.ContentLength != nil {
@@ -217,7 +220,11 @@ func (r *R2) Open(ctx context.Context, key string) (io.ReadCloser, int64, string
 	if out.ContentType != nil && strings.TrimSpace(*out.ContentType) != "" {
 		ctype = *out.ContentType
 	}
-	return out.Body, size, ctype, nil
+	body := out.Body
+	if cancel != nil {
+		body = &bodyWithCancel{ReadCloser: out.Body, cancel: cancel}
+	}
+	return body, size, ctype, nil
 }
 
 func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
@@ -231,7 +238,8 @@ func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
 	if info, err := os.Stat(cache); err == nil && info.Size() > 0 {
 		return cache, nil
 	}
-	rc, _, _, err := r.Open(ctx, key)
+	_ = os.Remove(cache)
+	rc, size, _, err := r.Open(ctx, key)
 	if err != nil {
 		return "", err
 	}
@@ -251,8 +259,15 @@ func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	if _, err := io.Copy(tmp, rc); err != nil {
+	wrote, err := io.Copy(tmp, rc)
+	if err != nil {
 		return "", err
+	}
+	if size > 0 && wrote != size {
+		return "", fmt.Errorf("r2 cache incomplete: got %d want %d", wrote, size)
+	}
+	if wrote <= 0 {
+		return "", ErrNotFound
 	}
 	if err := tmp.Sync(); err != nil {
 		return "", err
@@ -265,6 +280,35 @@ func (r *R2) LocalPath(ctx context.Context, key string) (string, error) {
 	}
 	ok = true
 	return cache, nil
+}
+
+type bodyWithCancel struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *bodyWithCancel) Close() error {
+	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return err
+}
+
+func mapR2GetErr(err error) error {
+	var nsk *types.NoSuchKey
+	if errors.As(err, &nsk) {
+		return ErrNotFound
+	}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return ErrNotFound
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "not found") {
+		return ErrNotFound
+	}
+	return fmt.Errorf("r2 get: %w", err)
 }
 
 func (r *R2) Delete(ctx context.Context, key string) error {

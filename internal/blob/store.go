@@ -2,8 +2,11 @@ package blob
 
 import (
 	"context"
+	"errors"
 	"io"
 )
+
+var ErrNotFound = errors.New("object not found")
 
 // Store is the object layer. Local disk today, object storage later.
 type Store interface {

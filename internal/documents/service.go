@@ -181,19 +181,65 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (io.ReadCloser, int64, string, string, error) {
+func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.File, int64, string, string, time.Time, error) {
 	src, err := s.repo.SourceMeta(ctx, docID, sourceID)
 	if err != nil {
-		return nil, 0, "", "", err
+		return nil, 0, "", "", time.Time{}, err
 	}
-	rc, size, ctype, err := s.blob.Open(ctx, src.StorageKey)
+	path, err := s.blob.LocalPath(ctx, src.StorageKey)
 	if err != nil {
-		return nil, 0, "", "", err
+		if errors.Is(err, blob.ErrNotFound) {
+			return nil, 0, "", "", time.Time{}, ErrNotFound
+		}
+		return nil, 0, "", "", time.Time{}, err
 	}
-	if src.ContentType != "" {
-		ctype = src.ContentType
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, 0, "", "", time.Time{}, ErrNotFound
+		}
+		return nil, 0, "", "", time.Time{}, err
 	}
-	return rc, size, ctype, src.Title, nil
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, "", "", time.Time{}, err
+	}
+	if info.Size() <= 0 {
+		_ = f.Close()
+		return nil, 0, "", "", time.Time{}, ErrNotFound
+	}
+	if src.SizeBytes > 0 && info.Size() != src.SizeBytes {
+		_ = f.Close()
+		_ = os.Remove(path)
+		path, err = s.blob.LocalPath(ctx, src.StorageKey)
+		if err != nil {
+			if errors.Is(err, blob.ErrNotFound) {
+				return nil, 0, "", "", time.Time{}, ErrNotFound
+			}
+			return nil, 0, "", "", time.Time{}, err
+		}
+		f, err = os.Open(path)
+		if err != nil {
+			return nil, 0, "", "", time.Time{}, err
+		}
+		info, err = f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return nil, 0, "", "", time.Time{}, err
+		}
+	}
+	name := strings.TrimSpace(src.Title)
+	if name == "" {
+		name = filepath.Base(src.StorageKey)
+	}
+	ctype := src.ContentType
+	if ctype == "" || ctype == "application/octet-stream" {
+		if strings.EqualFold(filepath.Ext(src.StorageKey), ".pdf") || strings.EqualFold(filepath.Ext(name), ".pdf") {
+			ctype = "application/pdf"
+		}
+	}
+	return f, info.Size(), ctype, name, info.ModTime(), nil
 }
 
 func (s *Service) RecoverPending(ctx context.Context) {

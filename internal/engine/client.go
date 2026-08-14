@@ -67,7 +67,7 @@ func (c *Client) Status() string {
 	}
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
 	if err != nil {

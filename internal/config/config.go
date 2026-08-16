@@ -32,6 +32,9 @@ type Config struct {
 	Heartbeat          time.Duration
 	ShutdownTimeout    time.Duration
 	EngineURL          string
+	AdminEmail         string
+	AdminPassword      string
+	AdminName          string
 }
 
 func Load() (Config, error) {
@@ -60,6 +63,9 @@ func Load() (Config, error) {
 		Heartbeat:          time.Duration(envInt64("HEARTBEAT_SECONDS", 2)) * time.Second,
 		ShutdownTimeout:    time.Duration(envInt64("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 		EngineURL:          env("ENGINE_BASE_URL", "http://127.0.0.1:8000"),
+		AdminEmail:         env("AUTH_ADMIN_EMAIL", ""),
+		AdminPassword:      env("AUTH_ADMIN_PASSWORD", ""),
+		AdminName:          env("AUTH_ADMIN_NAME", "Admin"),
 	}
 	if cfg.WorkerN < 1 {
 		cfg.WorkerN = 1

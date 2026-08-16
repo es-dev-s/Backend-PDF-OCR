@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"ocr-backend/internal/auth"
 	"ocr-backend/internal/blob"
 	"ocr-backend/internal/config"
 	"ocr-backend/internal/documents"
@@ -82,10 +83,47 @@ func main() {
 
 	eng := engine.New(cfg.EngineURL, log)
 	notes := notifications.NewRepo(pg.Handle, hub)
+	users := auth.NewRepo(pg.Handle)
 	docs := documents.NewService(documents.NewRepo(pg.Handle), store, hub, pool, notes, eng, log, cfg.MaxSources, cfg.MaxUploadBytes)
 	go docs.RunRecovery(ctx)
+	go func() {
+		t := time.NewTicker(time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				users.SweepExpired(ctx)
+			}
+		}
+	}()
+	go func() {
+		wait := time.NewTicker(time.Second)
+		defer wait.Stop()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			if _, err := pg.Status(); err == nil && pg.Handle() != nil {
+				seedCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				if err := users.EnsureAdmin(seedCtx, cfg.AdminEmail, cfg.AdminName, cfg.AdminPassword); err != nil {
+					log.Warn("seed admin failed", "err", err)
+				} else if strings.TrimSpace(cfg.AdminEmail) != "" {
+					log.Info("admin account ready", "email", strings.ToLower(strings.TrimSpace(cfg.AdminEmail)))
+				}
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-wait.C:
+			}
+		}
+	}()
 
-	api := httpapi.New(cfg, log, pg, rdb, store, hub, docs, notes, eng)
+	api := httpapi.New(cfg, log, pg, rdb, store, hub, docs, notes, eng, users)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

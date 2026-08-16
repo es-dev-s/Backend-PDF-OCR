@@ -9,10 +9,11 @@ import (
 type Status string
 
 const (
-	StatusProcessing Status = "processing"
-	StatusCompleted  Status = "completed"
-	StatusOriginal   Status = "original"
-	StatusDuplicate  Status = "duplicate"
+	StatusProcessing    Status = "processing"
+	StatusCompleted     Status = "completed"
+	StatusOriginal      Status = "original"
+	StatusDuplicate     Status = "duplicate"
+	StatusPendingReview Status = "pending_review"
 )
 
 type Uniqueness string
@@ -87,22 +88,24 @@ type Source struct {
 	FileURL     string           `json:"file_url"`
 	Duplicates  []DuplicateMatch `json:"duplicates"`
 	NeedsTitle  bool             `json:"-"`
+	Released    bool             `json:"-"`
 }
 
 type Document struct {
-	ID       uuid.UUID `json:"id"`
-	Title    string    `json:"title"`
-	Uploader string    `json:"uploader"`
-	Client   string    `json:"client"`
-	ERP      string    `json:"erp"`
-	ANZSCO   string    `json:"anzsco"`
-	Team     string    `json:"team"`
-	Member   string    `json:"member"`
-	Status   Status    `json:"status"`
-	Uploaded time.Time `json:"uploaded_at"`
-	URL      string    `json:"url"`
-	FileURL  string    `json:"file_url"`
-	Sources  []Source  `json:"sources"`
+	ID       uuid.UUID  `json:"id"`
+	Title    string     `json:"title"`
+	Uploader string     `json:"uploader"`
+	Client   string     `json:"client"`
+	ERP      string     `json:"erp"`
+	ANZSCO   string     `json:"anzsco"`
+	Team     string     `json:"team"`
+	Member   string     `json:"member"`
+	Status   Status     `json:"status"`
+	Uploaded time.Time  `json:"uploaded_at"`
+	URL      string     `json:"url"`
+	FileURL  string     `json:"file_url"`
+	Sources  []Source   `json:"sources"`
+	OwnerID  *uuid.UUID `json:"owner_id,omitempty"`
 }
 
 type CreateInput struct {

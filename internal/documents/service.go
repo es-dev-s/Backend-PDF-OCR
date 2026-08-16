@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
+	"ocr-backend/internal/auth"
 	"ocr-backend/internal/blob"
 	"ocr-backend/internal/engine"
 	"ocr-backend/internal/fingerprint"
@@ -30,6 +31,9 @@ import (
 
 type Notifier interface {
 	Create(ctx context.Context, title, detail string) error
+	NotifyUser(ctx context.Context, userID uuid.UUID, title, detail, kind string, docID *uuid.UUID) error
+	NotifyAdmins(ctx context.Context, title, detail, kind string, docID *uuid.UUID) error
+	HasUnreadKind(ctx context.Context, docID uuid.UUID, kind string) bool
 }
 
 type Service struct {
@@ -66,12 +70,27 @@ func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Po
 	}
 }
 
-func (s *Service) List(ctx context.Context) ([]Document, error) {
-	return s.repo.List(ctx)
+func (s *Service) List(ctx context.Context, pending bool) ([]Document, error) {
+	user, err := auth.Must(ctx)
+	if err != nil {
+		return nil, err
+	}
+	filter := ListFilter{OwnerID: user.ID, Admin: user.Admin(), Pending: pending}
+	if pending && !user.Admin() {
+		return nil, ErrForbidden
+	}
+	return s.repo.List(ctx, filter)
 }
 
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (Document, error) {
-	return s.repo.Get(ctx, id)
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return Document{}, err
+	}
+	if err := s.canRead(ctx, doc); err != nil {
+		return Document{}, err
+	}
+	return doc, nil
 }
 
 func (s *Service) NextERP(ctx context.Context) (string, error) {
@@ -94,11 +113,18 @@ func (s *Service) NextERP(ctx context.Context) (string, error) {
 }
 
 func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart.FileHeader) (Document, error) {
+	user, err := auth.Must(ctx)
+	if err != nil {
+		return Document{}, err
+	}
 	in.Client = strings.TrimSpace(in.Client)
 	in.ERP = strings.TrimSpace(in.ERP)
 	in.ANZSCO = strings.TrimSpace(in.ANZSCO)
 	in.Team = strings.TrimSpace(in.Team)
 	in.Member = strings.TrimSpace(in.Member)
+	if !user.Admin() || in.Member == "" {
+		in.Member = strings.TrimSpace(user.Name)
+	}
 	if in.ERP == "" || in.Client == "" || in.Member == "" {
 		return Document{}, ErrInvalid
 	}
@@ -110,6 +136,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 	}
 
 	now := time.Now().UTC()
+	owner := user.ID
 	doc := Document{
 		ID:       uuid.New(),
 		Client:   in.Client,
@@ -121,6 +148,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		Status:   StatusProcessing,
 		Uploaded: now,
 		Sources:  make([]Source, 0, len(files)),
+		OwnerID:  &owner,
 	}
 
 	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, now)
@@ -145,6 +173,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 }
 
 func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipart.FileHeader, titles []string) (Document, error) {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return Document{}, err
+	}
+	if err := s.canWrite(ctx, doc); err != nil {
+		return Document{}, err
+	}
 	if len(files) == 0 {
 		return Document{}, ErrNoFiles
 	}
@@ -173,6 +208,13 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 }
 
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.canWrite(ctx, doc); err != nil {
+		return err
+	}
 	keys, err := s.repo.Delete(ctx, id)
 	if err != nil {
 		return err
@@ -180,11 +222,124 @@ func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
 	for _, key := range keys {
 		_ = s.blob.Delete(ctx, key)
 	}
-	s.hub.Publish(ctx, "document.deleted", map[string]string{"id": id.String()})
+	s.hub.Publish(ctx, "document.deleted", map[string]any{
+		"id":       id.String(),
+		"owner_id": doc.OwnerID,
+	})
 	return nil
 }
 
+func (s *Service) Approve(ctx context.Context, id uuid.UUID) (Document, error) {
+	if err := s.requireAdmin(ctx); err != nil {
+		return Document{}, err
+	}
+	if err := s.repo.Approve(ctx, id); err != nil {
+		return Document{}, err
+	}
+	out, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return Document{}, err
+	}
+	s.hub.Publish(ctx, "document.updated", out)
+	if s.notes != nil && out.OwnerID != nil {
+		_ = s.notes.NotifyUser(ctx, *out.OwnerID, "Duplicate approved", fmt.Sprintf("%s is now in your documents.", label(out)), "approved", &out.ID)
+	}
+	return out, nil
+}
+
+func (s *Service) Reject(ctx context.Context, id uuid.UUID) error {
+	if err := s.requireAdmin(ctx); err != nil {
+		return err
+	}
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	keys, deleted, err := s.repo.RejectPending(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		_ = s.blob.Delete(ctx, key)
+	}
+	if deleted {
+		s.hub.Publish(ctx, "document.deleted", map[string]any{
+			"id":       id.String(),
+			"owner_id": doc.OwnerID,
+		})
+	} else {
+		out, getErr := s.repo.Get(ctx, id)
+		if getErr == nil {
+			s.hub.Publish(ctx, "document.updated", out)
+		}
+	}
+	if s.notes != nil && doc.OwnerID != nil {
+		_ = s.notes.NotifyUser(ctx, *doc.OwnerID, "Duplicate declined", fmt.Sprintf("%s was not approved and the pending files were removed.", label(doc)), "rejected", &doc.ID)
+	}
+	return nil
+}
+
+func (s *Service) requireAdmin(ctx context.Context) error {
+	user, err := auth.Must(ctx)
+	if err != nil {
+		return err
+	}
+	if !user.Admin() {
+		return ErrForbidden
+	}
+	return nil
+}
+
+func (s *Service) canRead(ctx context.Context, doc Document) error {
+	user, err := auth.Must(ctx)
+	if err != nil {
+		return err
+	}
+	if user.Admin() || Owns(doc.OwnerID, user.ID) {
+		return nil
+	}
+	return ErrForbidden
+}
+
+func (s *Service) canWrite(ctx context.Context, doc Document) error {
+	return s.canRead(ctx, doc)
+}
+
+func (s *Service) notifyReview(ctx context.Context, doc Document) {
+	if s.notes.HasUnreadKind(ctx, doc.ID, "review") {
+		return
+	}
+	name := label(doc)
+	who := strings.TrimSpace(doc.Member)
+	if who == "" {
+		who = "A member"
+	}
+	_ = s.notes.NotifyAdmins(ctx, "Duplicate needs review", fmt.Sprintf("%s · %s submitted a duplicate. Open Review to approve or decline.", name, who), "review", &doc.ID)
+	if doc.OwnerID != nil {
+		_ = s.notes.NotifyUser(ctx, *doc.OwnerID, "Waiting for review", fmt.Sprintf("%s is on hold until an admin reviews this duplicate.", name), "review_pending", &doc.ID)
+	}
+}
+
+func label(doc Document) string {
+	title := strings.TrimSpace(doc.Title)
+	if title != "" {
+		return title
+	}
+	erp := strings.TrimSpace(doc.ERP)
+	if erp != "" {
+		return erp
+	}
+	return "Document"
+}
+
 func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.File, int64, string, string, time.Time, error) {
+	doc, err := s.repo.Get(ctx, docID)
+	if err != nil {
+		return nil, 0, "", "", time.Time{}, err
+	}
+	if err := s.canRead(ctx, doc); err != nil {
+		return nil, 0, "", "", time.Time{}, err
+	}
 	src, err := s.repo.SourceMeta(ctx, docID, sourceID)
 	if err != nil {
 		return nil, 0, "", "", time.Time{}, err
@@ -638,6 +793,13 @@ func (s *Service) publishFingerprint(ctx context.Context, src Source, fp fingerp
 			return err
 		}
 		s.hub.Publish(ctx, "document.updated", doc)
+		if s.notes == nil {
+			continue
+		}
+		if doc.Status == StatusPendingReview && doc.ID == src.DocumentID {
+			s.notifyReview(ctx, doc)
+			continue
+		}
 		notified := false
 		for _, nid := range result.Notified {
 			if nid == id {
@@ -645,16 +807,23 @@ func (s *Service) publishFingerprint(ctx context.Context, src Source, fp fingerp
 				break
 			}
 		}
-		if !notified || s.notes == nil {
+		if !notified {
 			continue
 		}
-		title := "Document processed"
-		detail := fmt.Sprintf("%s finished processing", doc.Title)
-		if doc.Status == StatusDuplicate {
-			title = "Duplicate found"
-			detail = fmt.Sprintf("%s has duplicate sources", doc.Title)
+		switch doc.Status {
+		case StatusDuplicate:
+			if doc.OwnerID != nil {
+				_ = s.notes.NotifyUser(ctx, *doc.OwnerID, "Duplicate saved", fmt.Sprintf("%s was saved as a duplicate.", label(doc)), "duplicate", &doc.ID)
+			} else {
+				_ = s.notes.NotifyAdmins(ctx, "Duplicate saved", fmt.Sprintf("%s has duplicate sources.", label(doc)), "duplicate", &doc.ID)
+			}
+		default:
+			if doc.OwnerID != nil {
+				_ = s.notes.NotifyUser(ctx, *doc.OwnerID, "Document processed", fmt.Sprintf("%s finished processing.", label(doc)), "processed", &doc.ID)
+			} else {
+				_ = s.notes.NotifyAdmins(ctx, "Document processed", fmt.Sprintf("%s finished processing.", label(doc)), "processed", &doc.ID)
+			}
 		}
-		_ = s.notes.Create(ctx, title, detail)
 	}
 	return nil
 }

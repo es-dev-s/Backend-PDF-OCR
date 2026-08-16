@@ -208,10 +208,34 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 		}
 
 		if _, err := tx.Exec(ctx, `
+			UPDATE sources s SET
+				released = CASE
+					WHEN EXISTS (
+						SELECT 1 FROM documents d
+						LEFT JOIN users u ON u.id = d.owner_id
+						WHERE d.id = s.document_id
+						  AND (u.id IS NULL OR u.role = 'admin')
+					) THEN TRUE
+					WHEN s.uniqueness IN ('unique', 'original') THEN TRUE
+					WHEN s.uniqueness = 'duplicate' THEN FALSE
+					ELSE s.released
+				END
+			WHERE s.id = $1`, src.ID); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(ctx, `
 			UPDATE documents d SET
 				status = CASE
 					WHEN EXISTS (SELECT 1 FROM sources s WHERE s.document_id = d.id AND s.content_sha256 IS NULL)
 						THEN 'processing'
+					WHEN EXISTS (
+						SELECT 1 FROM sources s
+						WHERE s.document_id = d.id
+						  AND s.uniqueness = 'duplicate'
+						  AND s.released = FALSE
+					)
+						THEN 'pending_review'
 					WHEN EXISTS (
 						SELECT 1 FROM sources s
 						WHERE s.document_id = d.id

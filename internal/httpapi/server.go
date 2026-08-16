@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/google/uuid"
 
+	"ocr-backend/internal/auth"
 	"ocr-backend/internal/blob"
 	"ocr-backend/internal/config"
 	"ocr-backend/internal/documents"
@@ -32,17 +33,19 @@ import (
 const serviceName = "ocr-backend"
 
 type Server struct {
-	cfg     config.Config
-	log     *slog.Logger
-	pg      *postgres.Pool
-	rdb     *redisx.Client
-	blob    blob.Store
-	hub     *realtime.Hub
-	docs    *documents.Service
-	notes   *notifications.Repo
-	engine  *engine.Client
-	start   time.Time
-	uploads chan struct{}
+	cfg        config.Config
+	log        *slog.Logger
+	pg         *postgres.Pool
+	rdb        *redisx.Client
+	blob       blob.Store
+	hub        *realtime.Hub
+	docs       *documents.Service
+	notes      *notifications.Repo
+	engine     *engine.Client
+	users      *auth.Repo
+	loginLimit *auth.LoginGate
+	start      time.Time
+	uploads    chan struct{}
 }
 
 func New(
@@ -55,23 +58,26 @@ func New(
 	docs *documents.Service,
 	notes *notifications.Repo,
 	eng *engine.Client,
+	users *auth.Repo,
 ) *Server {
 	n := cfg.MaxInflightUploads
 	if n < 1 {
 		n = 8
 	}
 	return &Server{
-		cfg:     cfg,
-		log:     log,
-		pg:      pg,
-		rdb:     rdb,
-		blob:    store,
-		hub:     hub,
-		docs:    docs,
-		notes:   notes,
-		engine:  eng,
-		start:   time.Now(),
-		uploads: make(chan struct{}, n),
+		cfg:        cfg,
+		log:        log,
+		pg:         pg,
+		rdb:        rdb,
+		blob:       store,
+		hub:        hub,
+		docs:       docs,
+		notes:      notes,
+		engine:     eng,
+		users:      users,
+		loginLimit: auth.NewLoginGate(),
+		start:      time.Now(),
+		uploads:    make(chan struct{}, n),
 	}
 }
 
@@ -82,11 +88,12 @@ func (s *Server) Handler() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(s.logRequest)
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins: s.cfg.CORSOrigins,
-		AllowedMethods: []string{"GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"},
-		AllowedHeaders: []string{"Accept", "Content-Type", "Authorization", "X-Request-ID"},
-		ExposedHeaders: []string{"X-Request-ID"},
-		MaxAge:         300,
+		AllowedOrigins:   s.cfg.CORSOrigins,
+		AllowedMethods:   []string{"GET", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization", "X-Request-ID"},
+		ExposedHeaders:   []string{"X-Request-ID"},
+		AllowCredentials: true,
+		MaxAge:           300,
 	}))
 
 	r.Get("/", s.root)
@@ -96,19 +103,34 @@ func (s *Server) Handler() http.Handler {
 	r.Get("/health/stream", s.healthStream)
 
 	r.Route("/v1", func(r chi.Router) {
-		r.Get("/documents", s.listDocuments)
-		r.Post("/documents", s.createDocument)
-		r.Get("/documents/next-erp", s.nextERP)
-		r.Post("/documents/inspect", s.inspectFile)
-		r.Delete("/documents/{id}", s.deleteDocument)
-		r.Post("/documents/{id}/sources", s.addSources)
-		r.Get("/documents/{id}/sources/{sid}/file", s.getFile)
-		r.Head("/documents/{id}/sources/{sid}/file", s.getFile)
-		r.Post("/engine/title", s.suggestTitle)
-		r.Get("/notifications", s.listNotifications)
-		r.Patch("/notifications/{id}/read", s.markRead)
-		r.Post("/notifications/read-all", s.markAllRead)
-		r.Get("/events/stream", s.eventsStream)
+		r.Post("/auth/login", s.login)
+		r.Post("/auth/logout", s.logout)
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireAuth)
+			r.Get("/auth/me", s.me)
+			r.Get("/documents", s.listDocuments)
+			r.Post("/documents", s.createDocument)
+			r.Get("/documents/next-erp", s.nextERP)
+			r.Post("/documents/inspect", s.inspectFile)
+			r.Delete("/documents/{id}", s.deleteDocument)
+			r.Post("/documents/{id}/sources", s.addSources)
+			r.Get("/documents/{id}/sources/{sid}/file", s.getFile)
+			r.Head("/documents/{id}/sources/{sid}/file", s.getFile)
+			r.Post("/engine/title", s.suggestTitle)
+			r.Get("/notifications", s.listNotifications)
+			r.Patch("/notifications/{id}/read", s.markRead)
+			r.Post("/notifications/read-all", s.markAllRead)
+			r.Get("/events/stream", s.eventsStream)
+			r.Group(func(r chi.Router) {
+				r.Use(s.requireAdmin)
+				r.Get("/users", s.listUsers)
+				r.Post("/users", s.createUser)
+				r.Patch("/users/{id}", s.setUserDisabled)
+				r.Get("/reviews", s.listReviews)
+				r.Post("/reviews/{id}/approve", s.approveReview)
+				r.Post("/reviews/{id}/reject", s.rejectReview)
+			})
+		})
 	})
 	return r
 }
@@ -256,6 +278,10 @@ func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			user, _ := auth.From(r.Context())
+			if !eventVisible(user, raw) {
+				continue
+			}
 			fmt.Fprintf(w, "event: message\ndata: %s\n\n", raw)
 			flusher.Flush()
 		}
@@ -263,7 +289,7 @@ func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
-	items, err := s.docs.List(r.Context())
+	items, err := s.docs.List(r.Context(), false)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -490,6 +516,16 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		writeErrCode(w, http.StatusBadRequest, "no_files", "at least one file is required")
 	case errors.Is(err, documents.ErrTooMany):
 		writeErrCode(w, http.StatusBadRequest, "too_many", "source limit reached")
+	case errors.Is(err, auth.ErrUnauthorized), errors.Is(err, auth.ErrInvalidCreds):
+		writeErrCode(w, http.StatusUnauthorized, "unauthorized", "sign in required")
+	case errors.Is(err, auth.ErrForbidden), errors.Is(err, documents.ErrForbidden):
+		writeErrCode(w, http.StatusForbidden, "forbidden", "not allowed")
+	case errors.Is(err, auth.ErrEmailTaken):
+		writeErrCode(w, http.StatusConflict, "email_taken", "email is already in use")
+	case errors.Is(err, auth.ErrInvalid):
+		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid user")
+	case errors.Is(err, auth.ErrDisabled):
+		writeErrCode(w, http.StatusForbidden, "disabled", "account is disabled")
 	default:
 		s.log.Error("request failed", "err", err)
 		writeErrCode(w, http.StatusInternalServerError, "internal", "internal error")

@@ -22,7 +22,14 @@ var (
 	ErrNoFiles     = errors.New("no files")
 	ErrTooMany     = errors.New("too many sources")
 	ErrInvalid     = errors.New("invalid")
+	ErrForbidden   = errors.New("forbidden")
 )
+
+type ListFilter struct {
+	OwnerID uuid.UUID
+	Admin   bool
+	Pending bool
+}
 
 type Repo struct {
 	pool func() *pgxpool.Pool
@@ -40,15 +47,25 @@ func (r *Repo) db() (*pgxpool.Pool, error) {
 	return p, nil
 }
 
-func (r *Repo) List(ctx context.Context) ([]Document, error) {
+func (r *Repo) List(ctx context.Context, filter ListFilter) ([]Document, error) {
 	db, err := r.db()
 	if err != nil {
 		return nil, err
 	}
-	rows, err := db.Query(ctx, `
-		SELECT id, client, erp, anzsco, team, member, status, created_at
-		FROM documents
-		ORDER BY created_at DESC`)
+	query := `
+		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id
+		FROM documents`
+	args := []any{}
+	switch {
+	case filter.Admin && filter.Pending:
+		query += ` WHERE status = 'pending_review'`
+	case filter.Admin:
+	default:
+		query += ` WHERE owner_id = $1`
+		args = append(args, filter.OwnerID)
+	}
+	query += ` ORDER BY created_at DESC`
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -59,11 +76,13 @@ func (r *Repo) List(ctx context.Context) ([]Document, error) {
 	byID := make(map[uuid.UUID]*Document, 64)
 	for rows.Next() {
 		var d Document
-		if err := rows.Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded); err != nil {
+		var owner uuid.NullUUID
+		if err := rows.Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded, &owner); err != nil {
 			return nil, err
 		}
 		d.Member = strings.TrimSpace(d.Member)
 		d.Uploader = d.Member
+		d.OwnerID = nullUUID(owner)
 		d.Sources = []Source{}
 		docs = append(docs, d)
 		ids = append(ids, d.ID)
@@ -90,10 +109,11 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 		return Document{}, err
 	}
 	var d Document
+	var owner uuid.NullUUID
 	err = db.QueryRow(ctx, `
-		SELECT id, client, erp, anzsco, team, member, status, created_at
+		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id
 		FROM documents WHERE id=$1`, id).
-		Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded)
+		Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Document{}, ErrNotFound
 	}
@@ -101,6 +121,7 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 		return Document{}, err
 	}
 	d.Uploader = d.Member
+	d.OwnerID = nullUUID(owner)
 	d.Sources = []Source{}
 	byID := map[uuid.UUID]*Document{d.ID: &d}
 	if err := r.attachSources(ctx, db, []uuid.UUID{d.ID}, byID); err != nil {
@@ -192,9 +213,9 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 func (r *Repo) InsertDocument(ctx context.Context, d Document) error {
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO documents (id, client, erp, anzsco, team, member, status, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
-			d.ID, d.Client, d.ERP, d.ANZSCO, d.Team, d.Member, d.Status, d.Uploaded)
+			INSERT INTO documents (id, client, erp, anzsco, team, member, status, created_at, updated_at, owner_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)`,
+			d.ID, d.Client, d.ERP, d.ANZSCO, d.Team, d.Member, d.Status, d.Uploaded, d.OwnerID)
 		if isUniqueViolation(err) {
 			return ErrERPTaken
 		}
@@ -376,6 +397,99 @@ func (r *Repo) SetSourceTitle(ctx context.Context, id uuid.UUID, title string) e
 	return nil
 }
 
+func (r *Repo) Approve(ctx context.Context, id uuid.UUID) error {
+	return r.withTx(ctx, func(tx pgx.Tx) error {
+		var exists uuid.UUID
+		err := tx.QueryRow(ctx, `SELECT id FROM documents WHERE id=$1 FOR UPDATE`, id).Scan(&exists)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sources SET released=TRUE WHERE document_id=$1`, id); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			UPDATE documents d SET
+				status = CASE
+					WHEN EXISTS (SELECT 1 FROM sources s WHERE s.document_id = d.id AND s.content_sha256 IS NULL)
+						THEN 'processing'
+					WHEN EXISTS (
+						SELECT 1 FROM sources s
+						WHERE s.document_id = d.id
+						  AND s.uniqueness IN ('duplicate', 'original')
+					)
+						THEN 'duplicate'
+					ELSE 'completed'
+				END,
+				notified_at = NULL,
+				updated_at = now()
+			WHERE d.id = $1`, id)
+		return err
+	})
+}
+
+func (r *Repo) RejectPending(ctx context.Context, id uuid.UUID) (keys []string, deleted bool, err error) {
+	err = r.withTx(ctx, func(tx pgx.Tx) error {
+		var exists uuid.UUID
+		scanErr := tx.QueryRow(ctx, `SELECT id FROM documents WHERE id=$1 FOR UPDATE`, id).Scan(&exists)
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if scanErr != nil {
+			return scanErr
+		}
+		rows, qerr := tx.Query(ctx, `SELECT storage_key FROM sources WHERE document_id=$1 AND released=FALSE`, id)
+		if qerr != nil {
+			return qerr
+		}
+		defer rows.Close()
+		keys = keys[:0]
+		for rows.Next() {
+			var key string
+			if err := rows.Scan(&key); err != nil {
+				return err
+			}
+			keys = append(keys, key)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM sources WHERE document_id=$1 AND released=FALSE`, id); err != nil {
+			return err
+		}
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM sources WHERE document_id=$1`, id).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM documents WHERE id=$1`, id); err != nil {
+				return err
+			}
+			deleted = true
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE documents d SET
+				status = CASE
+					WHEN EXISTS (SELECT 1 FROM sources s WHERE s.document_id = d.id AND s.content_sha256 IS NULL)
+						THEN 'processing'
+					WHEN EXISTS (
+						SELECT 1 FROM sources s
+						WHERE s.document_id = d.id
+						  AND s.uniqueness IN ('duplicate', 'original')
+					)
+						THEN 'duplicate'
+					ELSE 'completed'
+				END,
+				updated_at = now()
+			WHERE d.id = $1`, id)
+		return err
+	})
+	return keys, deleted, err
+}
+
 func (r *Repo) ListUnhashed(ctx context.Context, limit int) ([]Source, error) {
 	db, err := r.db()
 	if err != nil {
@@ -438,4 +552,16 @@ func fileURL(docID, sourceID uuid.UUID) string {
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func nullUUID(v uuid.NullUUID) *uuid.UUID {
+	if !v.Valid {
+		return nil
+	}
+	id := v.UUID
+	return &id
+}
+
+func Owns(owner *uuid.UUID, userID uuid.UUID) bool {
+	return owner != nil && *owner == userID
 }

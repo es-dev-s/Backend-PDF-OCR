@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"ocr-backend/internal/engine"
 	"ocr-backend/internal/retry"
 )
 
@@ -25,10 +26,16 @@ var (
 	ErrForbidden   = errors.New("forbidden")
 )
 
+// MaxListRows caps a single document listing. The UI renders every row it is
+// given, so an uncapped query would sink both the API and the browser once the
+// table reaches millions of rows.
+const MaxListRows = 2000
+
 type ListFilter struct {
 	OwnerID uuid.UUID
 	Admin   bool
 	Pending bool
+	Limit   int
 }
 
 type Repo struct {
@@ -65,7 +72,12 @@ func (r *Repo) List(ctx context.Context, filter ListFilter) ([]Document, error) 
 		query += ` WHERE owner_id = $1`
 		args = append(args, filter.OwnerID)
 	}
-	query += ` ORDER BY created_at DESC`
+	limit := filter.Limit
+	if limit < 1 || limit > MaxListRows {
+		limit = MaxListRows
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT $%d`, len(args))
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -128,7 +140,7 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.UUID, byID map[uuid.UUID]*Document) error {
 	rows, err := db.Query(ctx, `
 		SELECT id, document_id, title, storage_key, content_type, size_bytes,
-		       content_sha256, uniqueness, score, created_at
+		       content_sha256, uniqueness, score, created_at, note
 		FROM sources
 		WHERE document_id = ANY($1)
 		ORDER BY created_at ASC`, ids)
@@ -144,7 +156,7 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 	collected := make([]rowSrc, 0, 16)
 	for rows.Next() {
 		var s Source
-		if err := rows.Scan(&s.ID, &s.DocumentID, &s.Title, &s.StorageKey, &s.ContentType, &s.SizeBytes, &s.SHA256, &s.Uniqueness, &s.Score, &s.Uploaded); err != nil {
+		if err := rows.Scan(&s.ID, &s.DocumentID, &s.Title, &s.StorageKey, &s.ContentType, &s.SizeBytes, &s.SHA256, &s.Uniqueness, &s.Score, &s.Uploaded, &s.Note); err != nil {
 			return err
 		}
 		s.Duplicates = []DuplicateMatch{}
@@ -176,7 +188,8 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 	mrows, err := db.Query(ctx, `
 		SELECT dm.id, dm.source_id, dm.matched_source_id, dm.title, dm.erp, dm.score, dm.uploaded_at, dm.kind,
 		       COALESCE(ms.uniqueness, 'unique'), COALESCE(md.client, ''), COALESCE(md.member, ''),
-		       md.id, COALESCE(ms.content_type, '')
+		       md.id, COALESCE(ms.content_type, ''),
+		       CASE WHEN ms.uniqueness = 'duplicate' THEN COALESCE(ms.note, '') ELSE '' END
 		FROM duplicate_matches dm
 		JOIN sources ms ON ms.id = dm.matched_source_id
 		JOIN documents md ON md.id = ms.document_id
@@ -191,9 +204,10 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 		var sourceID uuid.UUID
 		var matchedID uuid.UUID
 		var matchedDoc uuid.UUID
-		if err := mrows.Scan(&m.ID, &sourceID, &matchedID, &m.Title, &m.ERP, &m.Score, &m.Uploaded, &m.Kind, &m.Uniqueness, &m.Client, &m.Member, &matchedDoc, &m.ContentType); err != nil {
+		if err := mrows.Scan(&m.ID, &sourceID, &matchedID, &m.Title, &m.ERP, &m.Score, &m.Uploaded, &m.Kind, &m.Uniqueness, &m.Client, &m.Member, &matchedDoc, &m.ContentType, &m.Note); err != nil {
 			return err
 		}
+		m.Note = strings.TrimSpace(m.Note)
 		m.SourceID = matchedID
 		m.DocumentID = matchedDoc
 		m.FileURL = fileURL(matchedDoc, matchedID)
@@ -218,9 +232,9 @@ func (r *Repo) InsertDocument(ctx context.Context, d Document) error {
 		}
 		for _, s := range d.Sources {
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO sources (id, document_id, title, storage_key, content_type, size_bytes, uniqueness, created_at)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-				s.ID, d.ID, s.Title, s.StorageKey, s.ContentType, s.SizeBytes, s.Uniqueness, s.Uploaded); err != nil {
+				INSERT INTO sources (id, document_id, title, storage_key, content_type, size_bytes, uniqueness, created_at, needs_title, note)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				s.ID, d.ID, s.Title, s.StorageKey, s.ContentType, s.SizeBytes, s.Uniqueness, s.Uploaded, s.NeedsTitle, ClampNote(s.Note)); err != nil {
 				return err
 			}
 		}
@@ -250,10 +264,14 @@ func (r *Repo) InsertSources(ctx context.Context, documentID uuid.UUID, sources 
 			return ErrTooMany
 		}
 		for _, s := range sources {
+			srcNote := ClampNote(s.Note)
+			if srcNote == "" {
+				srcNote = note
+			}
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO sources (id, document_id, title, storage_key, content_type, size_bytes, uniqueness, created_at)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-				s.ID, documentID, s.Title, s.StorageKey, s.ContentType, s.SizeBytes, s.Uniqueness, s.Uploaded); err != nil {
+				INSERT INTO sources (id, document_id, title, storage_key, content_type, size_bytes, uniqueness, created_at, needs_title, note)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				s.ID, documentID, s.Title, s.StorageKey, s.ContentType, s.SizeBytes, s.Uniqueness, s.Uploaded, s.NeedsTitle, srcNote); err != nil {
 				return err
 			}
 		}
@@ -341,25 +359,37 @@ func (r *Repo) ExistsERP(ctx context.Context, erp string) (bool, error) {
 	return exists, err
 }
 
-func (r *Repo) ListERPs(ctx context.Context) ([]string, error) {
+// NextERPNumber resolves the lowest unused ERP sequence number at or above
+// start. It is answered entirely inside Postgres so the table can grow to
+// millions of rows without the API buffering every code in memory.
+func (r *Repo) NextERPNumber(ctx context.Context, start int64) (int64, error) {
 	db, err := r.db()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	rows, err := db.Query(ctx, `SELECT erp FROM documents`)
+	var next int64
+	err = db.QueryRow(ctx, `
+		WITH nums AS (
+			SELECT (substring(erp from 5))::bigint AS n
+			FROM documents
+			WHERE erp ~ '^ERP-[0-9]{1,15}$'
+			  AND (substring(erp from 5))::bigint >= $1
+		)
+		SELECT CASE
+			WHEN NOT EXISTS (SELECT 1 FROM nums WHERE n = $1) THEN $1
+			ELSE COALESCE((
+				SELECT MIN(a.n) + 1
+				FROM nums a
+				WHERE NOT EXISTS (SELECT 1 FROM nums b WHERE b.n = a.n + 1)
+			), $1)
+		END`, start).Scan(&next)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	out := make([]string, 0, 64)
-	for rows.Next() {
-		var erp string
-		if err := rows.Scan(&erp); err != nil {
-			return nil, err
-		}
-		out = append(out, erp)
+	if next < start {
+		next = start
 	}
-	return out, rows.Err()
+	return next, nil
 }
 
 func (r *Repo) withTx(ctx context.Context, fn func(pgx.Tx) error) error {
@@ -391,7 +421,7 @@ func (r *Repo) SetSourceTitle(ctx context.Context, id uuid.UUID, title string) e
 	if err != nil {
 		return err
 	}
-	tag, err := db.Exec(ctx, `UPDATE sources SET title=$2 WHERE id=$1`, id, title)
+	tag, err := db.Exec(ctx, `UPDATE sources SET title=$2, needs_title=false WHERE id=$1`, id, title)
 	if err != nil {
 		return err
 	}
@@ -399,6 +429,17 @@ func (r *Repo) SetSourceTitle(ctx context.Context, id uuid.UUID, title string) e
 		return ErrNotFound
 	}
 	return nil
+}
+
+// ClearNeedsTitle retires a source from the title queue without claiming a
+// title for it, for files the engine can never read.
+func (r *Repo) ClearNeedsTitle(ctx context.Context, id uuid.UUID) error {
+	db, err := r.db()
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(ctx, `UPDATE sources SET needs_title=false WHERE id=$1`, id)
+	return err
 }
 
 func (r *Repo) Approve(ctx context.Context, id uuid.UUID) error {
@@ -525,6 +566,38 @@ func (r *Repo) ListUnhashed(ctx context.Context, limit int) ([]Source, error) {
 	return out, rows.Err()
 }
 
+func (r *Repo) ListNeedingTitle(ctx context.Context, limit int) ([]Source, error) {
+	db, err := r.db()
+	if err != nil {
+		return nil, err
+	}
+	if limit < 1 {
+		limit = 50
+	}
+	rows, err := db.Query(ctx, `
+		SELECT id, document_id, title, storage_key, content_type, size_bytes,
+		       content_sha256, uniqueness, score, created_at
+		FROM sources
+		WHERE needs_title = TRUE
+		  AND created_at < now() - interval '15 seconds'
+		ORDER BY created_at ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Source, 0, limit)
+	for rows.Next() {
+		var s Source
+		if err := rows.Scan(&s.ID, &s.DocumentID, &s.Title, &s.StorageKey, &s.ContentType, &s.SizeBytes, &s.SHA256, &s.Uniqueness, &s.Score, &s.Uploaded); err != nil {
+			return nil, err
+		}
+		s.NeedsTitle = true
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func sortedUUIDs(set map[uuid.UUID]struct{}) []uuid.UUID {
 	ids := make([]uuid.UUID, 0, len(set))
 	for id := range set {
@@ -537,15 +610,23 @@ func sortedUUIDs(set map[uuid.UUID]struct{}) []uuid.UUID {
 func decorate(d *Document) {
 	d.Uploader = d.Member
 	d.URL = fmt.Sprintf("/backend/v1/documents/%s", d.ID)
+	for i := range d.Sources {
+		d.Sources[i].Title = engine.PublicTitle(d.Sources[i].Title)
+		d.Sources[i].FileURL = fileURL(d.ID, d.Sources[i].ID)
+		// The note explains why a duplicate was kept, so it is meaningless on
+		// the original or on a unique file.
+		if d.Sources[i].Uniqueness != Duplicate {
+			d.Sources[i].Note = ""
+		} else {
+			d.Sources[i].Note = strings.TrimSpace(d.Sources[i].Note)
+		}
+	}
 	if len(d.Sources) > 0 {
 		d.Title = d.Sources[0].Title
 		d.FileURL = fileURL(d.ID, d.Sources[0].ID)
 	} else {
 		d.Title = d.ERP
 		d.FileURL = d.URL
-	}
-	for i := range d.Sources {
-		d.Sources[i].FileURL = fileURL(d.ID, d.Sources[i].ID)
 	}
 }
 

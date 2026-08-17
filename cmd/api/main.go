@@ -84,7 +84,8 @@ func main() {
 	eng := engine.New(cfg.EngineURL, log)
 	notes := notifications.NewRepo(pg.Handle, hub)
 	users := auth.NewRepo(pg.Handle)
-	docs := documents.NewService(documents.NewRepo(pg.Handle), store, hub, pool, notes, eng, log, cfg.MaxSources, cfg.MaxUploadBytes)
+	docs := documents.NewService(documents.NewRepo(pg.Handle), store, hub, pool, notes, eng, log, cfg.MaxSources, cfg.MaxUploadBytes,
+		documents.Limits{Heavy: cfg.HeavyConcurrency, Title: cfg.TitleConcurrency})
 	go docs.RunRecovery(ctx)
 	go func() {
 		t := time.NewTicker(time.Hour)

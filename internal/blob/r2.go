@@ -33,7 +33,7 @@ type R2 struct {
 	readyAt    time.Time
 	readyErr   error
 	cacheMu    sync.Mutex
-	cacheLocks map[string]*sync.Mutex
+	cacheLocks map[string]*cacheLock
 }
 
 func NewR2(opts R2Options) (*R2, error) {
@@ -93,20 +93,40 @@ func NewR2(opts R2Options) (*R2, error) {
 			u.LeavePartsOnError = false
 		}),
 		cacheDir:   cacheDir,
-		cacheLocks: make(map[string]*sync.Mutex),
+		cacheLocks: make(map[string]*cacheLock),
 	}, nil
+}
+
+// cacheLock serialises access to one cached object. Entries are reference
+// counted so the table cannot grow with every object the node has ever touched.
+type cacheLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 func (r *R2) lockCache(path string) func() {
 	r.cacheMu.Lock()
 	m := r.cacheLocks[path]
 	if m == nil {
-		m = &sync.Mutex{}
+		m = &cacheLock{}
 		r.cacheLocks[path] = m
 	}
+	m.refs++
 	r.cacheMu.Unlock()
-	m.Lock()
-	return m.Unlock
+
+	m.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Unlock()
+			r.cacheMu.Lock()
+			m.refs--
+			if m.refs == 0 {
+				delete(r.cacheLocks, path)
+			}
+			r.cacheMu.Unlock()
+		})
+	}
 }
 
 func (r *R2) Driver() string { return "r2" }

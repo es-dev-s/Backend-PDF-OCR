@@ -38,6 +38,7 @@ type DuplicateMatch struct {
 	ContentType string     `json:"content_type,omitempty"`
 	Kind        string     `json:"kind,omitempty"`
 	Uniqueness  Uniqueness `json:"uniqueness,omitempty"`
+	Note        string     `json:"note,omitempty"`
 }
 
 type HashMatch struct {
@@ -46,24 +47,34 @@ type HashMatch struct {
 	Title      string
 	ERP        string
 	Client     string
+	ANZSCO     string
+	Team       string
 	Member     string
 	Uniqueness Uniqueness
 	Uploaded   time.Time
 	Score      float64
 	Kind       string
 	PageCount  int
+	Note       string
 }
 
 type PreviewMatch struct {
-	ID         uuid.UUID  `json:"id"`
+	ID         uuid.UUID `json:"id"`
+	DocumentID uuid.UUID `json:"document_id"`
+	// FileURL lets the upload form show the stored file next to the one being
+	// added, before anything is committed.
+	FileURL    string     `json:"file_url,omitempty"`
 	Title      string     `json:"title"`
 	ERP        string     `json:"erp"`
 	Client     string     `json:"client"`
+	ANZSCO     string     `json:"anzsco,omitempty"`
+	Team       string     `json:"team,omitempty"`
 	Member     string     `json:"member"`
 	Score      float64    `json:"score"`
 	Uploaded   time.Time  `json:"uploaded_at"`
 	Uniqueness Uniqueness `json:"uniqueness,omitempty"`
 	Kind       string     `json:"kind,omitempty"`
+	Note       string     `json:"note,omitempty"`
 }
 
 type PreviewResult struct {
@@ -87,6 +98,7 @@ type Source struct {
 	Uploaded    time.Time        `json:"uploaded_at"`
 	FileURL     string           `json:"file_url"`
 	Duplicates  []DuplicateMatch `json:"duplicates"`
+	Note        string           `json:"note,omitempty"`
 	NeedsTitle  bool             `json:"-"`
 	Released    bool             `json:"-"`
 }

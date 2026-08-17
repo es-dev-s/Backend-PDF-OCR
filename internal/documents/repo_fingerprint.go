@@ -291,7 +291,8 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 
 func queryExact(ctx context.Context, q querier, except uuid.UUID, sha string) ([]HashMatch, error) {
 	rows, err := q.Query(ctx, `
-		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.member, s.uniqueness, s.created_at
+		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at,
+		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.content_sha256 = $1 AND s.id <> $2
@@ -305,7 +306,8 @@ func queryExact(ctx context.Context, q querier, except uuid.UUID, sha string) ([
 
 func queryTextExact(ctx context.Context, q querier, except uuid.UUID, norm string) ([]HashMatch, error) {
 	rows, err := q.Query(ctx, `
-		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.member, s.uniqueness, s.created_at, s.page_count
+		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at, s.page_count,
+		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.text_norm_sha256 = $1 AND s.id <> $2
@@ -317,7 +319,7 @@ func queryTextExact(ctx context.Context, q querier, except uuid.UUID, norm strin
 	out := make([]HashMatch, 0)
 	for rows.Next() {
 		var m HashMatch
-		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.Member, &m.Uniqueness, &m.Uploaded, &m.PageCount); err != nil {
+		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.ANZSCO, &m.Team, &m.Member, &m.Uniqueness, &m.Uploaded, &m.PageCount, &m.Note); err != nil {
 			return nil, err
 		}
 		m.Kind = fingerprint.KindText
@@ -353,7 +355,7 @@ func queryLSH(ctx context.Context, q querier, except uuid.UUID, kind string, has
 		var m HashMatch
 		var raw *int64
 		var pages *int
-		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.Member, &m.Uniqueness, &m.Uploaded, &pages, &raw); err != nil {
+		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.ANZSCO, &m.Team, &m.Member, &m.Uniqueness, &m.Uploaded, &pages, &raw, &m.Note); err != nil {
 			return nil, err
 		}
 		if raw == nil {
@@ -375,7 +377,8 @@ func queryLSH(ctx context.Context, q querier, except uuid.UUID, kind string, has
 
 func lshQuery(hashCol string) string {
 	return `
-		SELECT DISTINCT s.id, s.document_id, s.title, d.erp, d.client, d.member, s.uniqueness, s.created_at, s.page_count, ` + hashCol + `
+		SELECT DISTINCT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at, s.page_count, ` + hashCol + `,
+		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
 		FROM fingerprint_lsh l
 		JOIN sources s ON s.id = l.source_id
 		JOIN documents d ON d.id = s.document_id
@@ -394,7 +397,7 @@ func scanMatches(rows pgx.Rows, kind string, score float64) ([]HashMatch, error)
 	out := make([]HashMatch, 0)
 	for rows.Next() {
 		var m HashMatch
-		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.Member, &m.Uniqueness, &m.Uploaded); err != nil {
+		if err := rows.Scan(&m.SourceID, &m.DocumentID, &m.Title, &m.ERP, &m.Client, &m.ANZSCO, &m.Team, &m.Member, &m.Uniqueness, &m.Uploaded, &m.Note); err != nil {
 			return nil, err
 		}
 		m.Kind = kind

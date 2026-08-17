@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -47,13 +48,31 @@ type Service struct {
 	maxN    int
 	maxB    int64
 	hashing sync.Map
+	titling sync.Map
 	heavy   chan struct{}
+	titles  chan struct{}
 	put     chan struct{}
+
+	trimmedAt atomic.Int64
 }
 
-func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Pool, notes Notifier, eng *engine.Client, log *slog.Logger, maxSources int, maxBytes int64) *Service {
+// Limits bounds the two kinds of background work. Fingerprinting is bounded by
+// memory; engine calls are bounded by the engine itself. They get separate
+// budgets so a slow engine can never stall duplicate detection.
+type Limits struct {
+	Heavy int
+	Title int
+}
+
+func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Pool, notes Notifier, eng *engine.Client, log *slog.Logger, maxSources int, maxBytes int64, limits Limits) *Service {
 	if maxSources < 1 {
 		maxSources = 4
+	}
+	if limits.Heavy < 1 {
+		limits.Heavy = 1
+	}
+	if limits.Title < 1 {
+		limits.Title = 1
 	}
 	return &Service{
 		repo:   repo,
@@ -65,7 +84,8 @@ func NewService(repo *Repo, store blob.Store, hub *realtime.Hub, pool *worker.Po
 		log:    log,
 		maxN:   maxSources,
 		maxB:   maxBytes,
-		heavy:  make(chan struct{}, 1),
+		heavy:  make(chan struct{}, limits.Heavy),
+		titles: make(chan struct{}, limits.Title),
 		put:    make(chan struct{}, 2),
 	}
 }
@@ -100,23 +120,14 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 	return doc, nil
 }
 
+const firstERP = 10001
+
 func (s *Service) NextERP(ctx context.Context) (string, error) {
-	used, err := s.repo.ListERPs(ctx)
+	n, err := s.repo.NextERPNumber(ctx, firstERP)
 	if err != nil {
 		return "", err
 	}
-	set := make(map[string]struct{}, len(used))
-	for _, erp := range used {
-		set[strings.ToLower(erp)] = struct{}{}
-	}
-	n := 10001
-	for {
-		code := fmt.Sprintf("ERP-%d", n)
-		if _, ok := set[strings.ToLower(code)]; !ok {
-			return code, nil
-		}
-		n++
-	}
+	return fmt.Sprintf("ERP-%d", n), nil
 }
 
 func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart.FileHeader) (Document, error) {
@@ -159,7 +170,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		ReviewNote: ClampNote(in.Note),
 	}
 
-	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, now)
+	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, doc.ReviewNote, now)
 	if err != nil {
 		s.cleanup(written)
 		return Document{}, err
@@ -195,7 +206,7 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 		files = files[:s.maxN]
 	}
 	now := time.Now().UTC()
-	written, err := s.storeFiles(ctx, id, files, titles, now)
+	written, err := s.storeFiles(ctx, id, files, titles, note, now)
 	if err != nil {
 		s.cleanup(written)
 		return Document{}, err
@@ -408,19 +419,41 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 	return f, info.Size(), ctype, name, info.ModTime(), nil
 }
 
-func (s *Service) RecoverPending(ctx context.Context) {
-	sources, err := s.repo.ListUnhashed(ctx, 1)
+// recoverBatch is how many stalled rows one sweep claims. It is deliberately
+// smaller than the worker queue so a backlog of millions drains steadily
+// without the sweeper ever blocking on a full pool.
+const recoverBatch = 100
+
+// RecoverPending requeues rows that never finished hashing or title
+// extraction. It reports whether the batch was full, so the caller can sweep
+// again immediately instead of trickling through a large backlog.
+func (s *Service) RecoverPending(ctx context.Context) bool {
+	more := false
+	sources, err := s.repo.ListUnhashed(ctx, recoverBatch)
 	if err != nil {
 		if !errors.Is(err, ErrUnavailable) {
 			s.log.Warn("recover pending failed", "err", err)
 		}
-		return
+		return false
 	}
-	if len(sources) == 0 {
-		return
+	if len(sources) > 0 {
+		s.log.Info("requeue unhashed sources", "count", len(sources))
+		s.enqueueHash(ctx, sources)
+		more = len(sources) == recoverBatch
 	}
-	s.log.Info("requeue unhashed sources", "count", len(sources))
-	s.enqueueHash(ctx, sources)
+	pendingTitles, err := s.repo.ListNeedingTitle(ctx, recoverBatch)
+	if err != nil {
+		if !errors.Is(err, ErrUnavailable) {
+			s.log.Warn("recover titles failed", "err", err)
+		}
+		return more
+	}
+	if len(pendingTitles) == 0 {
+		return more
+	}
+	s.log.Info("requeue title extraction", "count", len(pendingTitles))
+	s.enqueueTitle(ctx, pendingTitles)
+	return more || len(pendingTitles) == recoverBatch
 }
 
 func (s *Service) RunRecovery(ctx context.Context) {
@@ -441,21 +474,32 @@ func (s *Service) RunRecovery(ctx context.Context) {
 		return
 	case <-time.After(20 * time.Second):
 	}
-	s.RecoverPending(ctx)
-	t := time.NewTicker(60 * time.Second)
+	more := s.RecoverPending(ctx)
+	t := time.NewTimer(recoverDelay(more))
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.RecoverPending(ctx)
+			more = s.RecoverPending(ctx)
+			t.Reset(recoverDelay(more))
 		}
 	}
 }
 
-func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*multipart.FileHeader, titles []string, now time.Time) ([]Source, error) {
+// recoverDelay keeps the sweeper idle-cheap, but drains a backlog quickly once
+// it finds a full batch.
+func recoverDelay(more bool) time.Duration {
+	if more {
+		return 5 * time.Second
+	}
+	return 60 * time.Second
+}
+
+func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*multipart.FileHeader, titles []string, note string, now time.Time) ([]Source, error) {
 	out := make([]Source, len(files))
+	note = ClampNote(note)
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(2)
 	var mu sync.Mutex
@@ -508,14 +552,22 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 			if err != nil {
 				return err
 			}
-			printed := ""
+			rawTitle := ""
 			if i < len(titles) {
-				printed = engine.PrintedTitle(titles[i])
+				rawTitle = strings.TrimSpace(titles[i])
 			}
-			provided := printed != ""
-			title := name
-			if provided {
-				title = printed
+			printed := engine.PrintedTitle(rawTitle)
+			unreadable := strings.EqualFold(rawTitle, engine.UnreadableTitle)
+			isPDF := sniffed == "pdf"
+			title := printed
+			if unreadable {
+				title = engine.UnreadableTitle
+			}
+			if title == "" && isPDF {
+				title = engine.UntitledDocument
+			}
+			if title == "" {
+				title = name
 			}
 			mu.Lock()
 			out[i] = Source{
@@ -527,7 +579,8 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 				SizeBytes:   fh.Size,
 				Uniqueness:  Unique,
 				Uploaded:    now.Add(time.Duration(i) * time.Millisecond),
-				NeedsTitle:  sniffed == "pdf" && !provided,
+				NeedsTitle:  isPDF && printed == "" && !unreadable,
+				Note:        note,
 			}
 			mu.Unlock()
 			return nil
@@ -558,9 +611,11 @@ func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
 		if _, loaded := s.hashing.Load(src.ID.String()); loaded {
 			continue
 		}
-		if err := s.pool.Submit(ctx, func(jobCtx context.Context) {
+		// A saturated pool must never stall an upload: the row stays unhashed
+		// and the recovery sweeper picks it up.
+		if err := s.pool.TrySubmit(func(jobCtx context.Context) {
 			s.hashSource(jobCtx, src)
-		}); err != nil {
+		}); err != nil && !errors.Is(err, worker.ErrBusy) {
 			s.log.Warn("hash enqueue failed", "err", err, "source", src.ID)
 		}
 	}
@@ -583,9 +638,12 @@ func (s *Service) enqueueTitle(ctx context.Context, sources []Source) {
 			continue
 		}
 		src := src
-		if err := s.pool.Submit(ctx, func(jobCtx context.Context) {
+		if _, loaded := s.titling.Load(src.ID.String()); loaded {
+			continue
+		}
+		if err := s.pool.TrySubmit(func(jobCtx context.Context) {
 			s.titleSource(jobCtx, src)
-		}); err != nil {
+		}); err != nil && !errors.Is(err, worker.ErrBusy) {
 			s.log.Warn("title enqueue failed", "err", err, "source", src.ID)
 		}
 	}
@@ -604,11 +662,8 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 		return out
 	default:
 	}
-	if !s.acquireHeavy(ctx) {
-		out.OK = false
-		return out
-	}
-	defer s.releaseHeavy()
+	// Spooling the upload to disk is bounded by maxB and waits on the client,
+	// so it runs before the memory gate.
 	path, err := writeInspectTemp(r, filename, s.maxB)
 	if err != nil {
 		s.log.Warn("inspect temp failed", "err", err, "file", filename)
@@ -617,6 +672,11 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 	}
 	defer os.Remove(path)
 
+	if !s.acquireHeavy(ctx) {
+		out.OK = false
+		return out
+	}
+	defer s.releaseHeavy()
 	fp, err := fingerprint.Digest(path)
 	if err != nil {
 		s.log.Warn("inspect digest failed", "err", err, "file", filename)
@@ -636,14 +696,19 @@ func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader)
 		for _, m := range matches {
 			out.Matches = append(out.Matches, PreviewMatch{
 				ID:         m.SourceID,
+				DocumentID: m.DocumentID,
+				FileURL:    fileURL(m.DocumentID, m.SourceID),
 				Title:      m.Title,
 				ERP:        m.ERP,
 				Client:     m.Client,
+				ANZSCO:     strings.TrimSpace(m.ANZSCO),
+				Team:       strings.TrimSpace(m.Team),
 				Member:     m.Member,
 				Score:      m.Score,
 				Uploaded:   m.Uploaded,
 				Uniqueness: m.Uniqueness,
 				Kind:       m.Kind,
+				Note:       strings.TrimSpace(m.Note),
 			})
 		}
 	}
@@ -679,10 +744,10 @@ func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader
 	if s.engine == nil || !s.engine.Configured() {
 		return out
 	}
-	if !s.acquireHeavy(ctx) {
+	if !s.acquireTitle(ctx) {
 		return out
 	}
-	defer s.releaseHeavy()
+	defer s.releaseTitle()
 	head := make([]byte, 16)
 	n, _ := io.ReadFull(r, head)
 	if n > 0 {
@@ -698,8 +763,12 @@ func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader
 	res, err := s.engine.Title(ctx, filename, reader)
 	if err != nil {
 		s.log.Warn("engine title failed", "err", err, "file", filename)
-		return out
+		return engine.Result{OK: false, Filename: filename, Title: engine.UntitledDocument, Message: err.Error()}
 	}
+	if res.Filename == "" {
+		res.Filename = filename
+	}
+	res.Title = engine.DisplayName(res)
 	return res
 }
 
@@ -707,29 +776,39 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 	if s.engine == nil || !s.engine.Configured() {
 		return
 	}
-	if !s.acquireHeavy(ctx) {
+	key := src.ID.String()
+	if _, loaded := s.titling.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	defer s.releaseHeavy()
+	defer s.titling.Delete(key)
+
+	if !s.acquireTitle(ctx) {
+		return
+	}
+	defer s.releaseTitle()
 	err := retry.Do(ctx, 4, func(ctx context.Context) error {
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
+		if errors.Is(err, blob.ErrNotFound) {
+			// The file is gone for good, so retrying forever would only burn
+			// engine capacity on every recovery sweep.
+			return s.repo.ClearNeedsTitle(ctx, src.ID)
+		}
 		if err != nil {
 			return err
 		}
 		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return s.repo.ClearNeedsTitle(ctx, src.ID)
+		}
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		res, err := s.engine.Title(ctx, src.Title, f)
+		res, err := s.engine.Title(ctx, filepath.Base(src.StorageKey), f)
 		if err != nil {
 			return err
 		}
-		printed := engine.PrintedTitle(res.Title)
-		if printed == "" {
-			return nil
-		}
-		if err := s.repo.SetSourceTitle(ctx, src.ID, printed); err != nil {
+		if err := s.repo.SetSourceTitle(ctx, src.ID, engine.DisplayName(res)); err != nil {
 			return err
 		}
 		doc, err := s.repo.Get(ctx, src.DocumentID)
@@ -754,11 +833,6 @@ func (s *Service) hashSource(ctx context.Context, src Source) {
 	}
 	defer s.hashing.Delete(key)
 
-	if !s.acquireHeavy(ctx) {
-		return
-	}
-	defer s.releaseHeavy()
-
 	err := retry.Do(ctx, 8, func(ctx context.Context) error {
 		meta, err := s.repo.SourceMeta(ctx, src.DocumentID, src.ID)
 		if err != nil {
@@ -775,7 +849,13 @@ func (s *Service) hashSource(ctx context.Context, src Source) {
 		if err != nil {
 			return err
 		}
+		// Only the analysis holds a file in memory. Fetching the object is a
+		// network wait, and gating it would throttle the whole pipeline.
+		if !s.acquireHeavy(ctx) {
+			return ctx.Err()
+		}
 		fp, err := fingerprint.Analyze(path, filepath.Base(src.StorageKey), src.ContentType)
+		s.releaseHeavy()
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				s.log.Warn("source file gone; finishing uniqueness without file", "source", src.ID, "key", src.StorageKey)
@@ -891,6 +971,42 @@ func (s *Service) acquireHeavy(ctx context.Context) bool {
 func (s *Service) releaseHeavy() {
 	if s.heavy != nil {
 		<-s.heavy
+	}
+	s.trimMemory()
+}
+
+// acquireTitle gates calls to the extraction engine. It is deliberately
+// separate from acquireHeavy so a slow engine cannot block fingerprinting,
+// which is what decides whether a document is a duplicate.
+func (s *Service) acquireTitle(ctx context.Context) bool {
+	if s.titles == nil {
+		return true
+	}
+	select {
+	case s.titles <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Service) releaseTitle() {
+	if s.titles != nil {
+		<-s.titles
+	}
+}
+
+// trimMemory returns freed pages to the OS after large files are processed, but
+// no more than once a second: FreeOSMemory stops the world, so calling it on
+// every job would cost more than it saves once several run at a time.
+func (s *Service) trimMemory() {
+	now := time.Now().UnixNano()
+	last := s.trimmedAt.Load()
+	if now-last < int64(time.Second) {
+		return
+	}
+	if !s.trimmedAt.CompareAndSwap(last, now) {
+		return
 	}
 	debug.FreeOSMemory()
 }

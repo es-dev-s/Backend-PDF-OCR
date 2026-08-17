@@ -51,3 +51,34 @@ func TestCapWorkers(t *testing.T) {
 		t.Fatalf("zero -> %d want 2", got)
 	}
 }
+
+func TestCapHeavy(t *testing.T) {
+	if got := capHeavy(0, 2, true); got != 2 {
+		t.Fatalf("hosted default -> %d want 2", got)
+	}
+	if got := capHeavy(64, 2, true); got != 2 {
+		t.Fatalf("hosted override -> %d want 2", got)
+	}
+	if got := capHeavy(0, 4, false); got != 2 {
+		t.Fatalf("local default -> %d want 2", got)
+	}
+	if got := capHeavy(64, 4, false); got != 8 {
+		t.Fatalf("local override -> %d want 8", got)
+	}
+}
+
+func TestCapTitle(t *testing.T) {
+	// Engine calls wait on the network, so they run wider than fingerprinting.
+	if got := capTitle(0, 2, true); got != 2 {
+		t.Fatalf("hosted default -> %d want 2", got)
+	}
+	if got := capTitle(64, 2, true); got != 4 {
+		t.Fatalf("hosted override -> %d want 4", got)
+	}
+	if got := capTitle(0, 4, false); got != 4 {
+		t.Fatalf("local default -> %d want 4", got)
+	}
+	if got := capTitle(-1, 0, false); got != 1 {
+		t.Fatalf("degenerate -> %d want 1", got)
+	}
+}

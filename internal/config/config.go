@@ -26,6 +26,8 @@ type Config struct {
 	MaxUploadBytes     int64
 	MaxSources         int
 	WorkerN            int
+	HeavyConcurrency   int
+	TitleConcurrency   int
 	PGMaxConns         int32
 	RedisPoolSize      int
 	MaxInflightUploads int
@@ -57,6 +59,8 @@ func Load() (Config, error) {
 		MaxUploadBytes:     envInt64("MAX_UPLOAD_BYTES", 50<<20),
 		MaxSources:         int(envInt64("MAX_SOURCES", 4)),
 		WorkerN:            capWorkers(int(envInt64("WORKER_CONCURRENCY", 2)), hosted()),
+		HeavyConcurrency:   int(envInt64("HEAVY_CONCURRENCY", 0)),
+		TitleConcurrency:   int(envInt64("TITLE_CONCURRENCY", 0)),
 		PGMaxConns:         int32(envInt64("PG_MAX_CONNS", 8)),
 		RedisPoolSize:      int(envInt64("REDIS_POOL_SIZE", 8)),
 		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 8)),
@@ -93,6 +97,8 @@ func Load() (Config, error) {
 	if cfg.Heartbeat < time.Second {
 		cfg.Heartbeat = 2 * time.Second
 	}
+	cfg.HeavyConcurrency = capHeavy(cfg.HeavyConcurrency, cfg.WorkerN, hosted())
+	cfg.TitleConcurrency = capTitle(cfg.TitleConcurrency, cfg.WorkerN, hosted())
 
 	r2OK := cfg.R2AccountID != "" && cfg.R2AccessKey != "" && cfg.R2Secret != "" && cfg.R2Bucket != ""
 	driver, err := pickStorage(cfg.StorageDriver, r2OK, hosted())
@@ -138,6 +144,45 @@ func capWorkers(n int, hosted bool) int {
 	}
 	if n > max {
 		return max
+	}
+	return n
+}
+
+// capHeavy bounds fingerprinting, which holds a whole file in memory. Small
+// containers keep this low so a burst of uploads cannot exhaust the heap.
+func capHeavy(n, workers int, hosted bool) int {
+	if n < 1 {
+		n = workers / 2
+		if n < 2 {
+			n = 2
+		}
+	}
+	limit := 8
+	if hosted {
+		limit = 2
+	}
+	if n > limit {
+		n = limit
+	}
+	return n
+}
+
+// capTitle bounds calls to the extraction engine. These wait on the network
+// rather than local memory, so they run wider than fingerprinting and, more
+// importantly, never queue behind it.
+func capTitle(n, workers int, hosted bool) int {
+	if n < 1 {
+		n = workers
+	}
+	if n < 1 {
+		n = 1
+	}
+	limit := 16
+	if hosted {
+		limit = 4
+	}
+	if n > limit {
+		n = limit
 	}
 	return n
 }

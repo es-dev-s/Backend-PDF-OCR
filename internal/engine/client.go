@@ -17,8 +17,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const MaxTitleBytes = 50 << 20
-const TitleTimeout = 120 * time.Second
+const (
+	MaxTitleBytes    = 50 << 20
+	TitleTimeout     = 120 * time.Second
+	UntitledDocument = "Untitled document"
+	UnreadableTitle  = "Title not readable (scanned PDF)"
+	noOCRMessage     = "No OCR"
+)
 
 type Result struct {
 	OK          bool   `json:"ok"`
@@ -192,7 +197,9 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (R
 		return out, 2 * time.Second, fmt.Errorf("engine status %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
-		return out, 0, fmt.Errorf("engine status %d", resp.StatusCode)
+		out.OK = false
+		out.Message = parseEngineDetail(body, resp.StatusCode)
+		return out, 0, nil
 	}
 
 	var parsed extractBody
@@ -254,11 +261,61 @@ func PrintedTitle(s string) string {
 	if out == "" {
 		return ""
 	}
-	if strings.HasSuffix(strings.ToLower(out), ".pdf") {
+	if looksLikeFilename(out) {
 		return ""
 	}
-	if strings.EqualFold(out, "Untitled document") {
+	if strings.EqualFold(out, UntitledDocument) {
+		return ""
+	}
+	if strings.EqualFold(out, UnreadableTitle) {
 		return ""
 	}
 	return out
+}
+
+// DisplayName is the Engine contract heading. Never the upload filename.
+func DisplayName(res Result) string {
+	if title := PrintedTitle(res.Title); title != "" {
+		return title
+	}
+	if !res.OK && strings.EqualFold(strings.TrimSpace(res.Message), noOCRMessage) {
+		return UnreadableTitle
+	}
+	return UntitledDocument
+}
+
+// PublicTitle is what the API and UI may show. Never a .pdf upload name.
+func PublicTitle(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, UnreadableTitle) {
+		return UnreadableTitle
+	}
+	if title := PrintedTitle(s); title != "" {
+		return title
+	}
+	return UntitledDocument
+}
+
+func looksLikeFilename(s string) bool {
+	lower := strings.ToLower(strings.TrimSpace(s))
+	return strings.HasSuffix(lower, ".pdf")
+}
+
+func parseEngineDetail(body []byte, status int) string {
+	var payload struct {
+		Detail json.RawMessage `json:"detail"`
+	}
+	if json.Unmarshal(body, &payload) == nil && len(payload.Detail) > 0 {
+		var text string
+		if json.Unmarshal(payload.Detail, &text) == nil && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+		var items []struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal(payload.Detail, &items) == nil && len(items) > 0 && strings.TrimSpace(items[0].Msg) != "" {
+			return strings.TrimSpace(items[0].Msg)
+		}
+	}
+	return fmt.Sprintf("engine status %d", status)
 }

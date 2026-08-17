@@ -17,13 +17,16 @@ import (
 	"github.com/google/uuid"
 )
 
-const MaxTitleBytes = 2 << 20
+const MaxTitleBytes = 50 << 20
+const TitleTimeout = 120 * time.Second
 
 type Result struct {
 	OK          bool   `json:"ok"`
 	Title       string `json:"title,omitempty"`
 	TitleSource string `json:"title_source,omitempty"`
 	Filename    string `json:"filename,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Method      string `json:"method,omitempty"`
 }
 
 type extractBody struct {
@@ -31,6 +34,8 @@ type extractBody struct {
 	Title       *string `json:"title"`
 	TitleSource *string `json:"title_source"`
 	Filename    *string `json:"filename"`
+	Message     *string `json:"message"`
+	Method      *string `json:"method"`
 }
 
 type Client struct {
@@ -158,7 +163,7 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (R
 		return out, 0, err
 	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, TitleTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base+"/v1/ocr", &buf)
 	if err != nil {
@@ -196,13 +201,19 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (R
 	}
 	out.OK = parsed.OK
 	if parsed.Title != nil {
-		out.Title = SanitizeTitle(*parsed.Title)
+		out.Title = PrintedTitle(*parsed.Title)
 	}
 	if parsed.TitleSource != nil {
 		out.TitleSource = *parsed.TitleSource
 	}
 	if parsed.Filename != nil {
 		out.Filename = *parsed.Filename
+	}
+	if parsed.Message != nil {
+		out.Message = strings.TrimSpace(*parsed.Message)
+	}
+	if parsed.Method != nil {
+		out.Method = strings.TrimSpace(*parsed.Method)
 	}
 	return out, 0, nil
 }
@@ -234,6 +245,20 @@ func SanitizeTitle(s string) string {
 	if len(runes) > 200 {
 		out = string(runes[:200])
 		out = strings.TrimSpace(out)
+	}
+	return out
+}
+
+func PrintedTitle(s string) string {
+	out := SanitizeTitle(s)
+	if out == "" {
+		return ""
+	}
+	if strings.HasSuffix(strings.ToLower(out), ".pdf") {
+		return ""
+	}
+	if strings.EqualFold(out, "Untitled document") {
+		return ""
 	}
 	return out
 }

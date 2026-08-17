@@ -500,12 +500,14 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 			if err != nil {
 				return err
 			}
-			provided := i < len(titles) && strings.TrimSpace(titles[i]) != ""
+			printed := ""
+			if i < len(titles) {
+				printed = engine.PrintedTitle(titles[i])
+			}
+			provided := printed != ""
 			title := name
 			if provided {
-				if cleaned := engine.SanitizeTitle(titles[i]); cleaned != "" {
-					title = cleaned
-				}
+				title = printed
 			}
 			mu.Lock()
 			out[i] = Source{
@@ -715,10 +717,11 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 		if err != nil {
 			return err
 		}
-		if !res.OK || res.Title == "" {
+		printed := engine.PrintedTitle(res.Title)
+		if printed == "" {
 			return nil
 		}
-		if err := s.repo.SetSourceTitle(ctx, src.ID, res.Title); err != nil {
+		if err := s.repo.SetSourceTitle(ctx, src.ID, printed); err != nil {
 			return err
 		}
 		doc, err := s.repo.Get(ctx, src.DocumentID)

@@ -82,6 +82,13 @@ func (s *Service) List(ctx context.Context, pending bool) ([]Document, error) {
 	return s.repo.List(ctx, filter)
 }
 
+func (s *Service) UploadStats(ctx context.Context, from, to time.Time) (UploadStats, error) {
+	if err := s.requireAdmin(ctx); err != nil {
+		return UploadStats{}, err
+	}
+	return s.repo.UploadStats(ctx, from, to)
+}
+
 func (s *Service) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 	doc, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -138,17 +145,18 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 	now := time.Now().UTC()
 	owner := user.ID
 	doc := Document{
-		ID:       uuid.New(),
-		Client:   in.Client,
-		ERP:      in.ERP,
-		ANZSCO:   in.ANZSCO,
-		Team:     in.Team,
-		Member:   in.Member,
-		Uploader: in.Member,
-		Status:   StatusProcessing,
-		Uploaded: now,
-		Sources:  make([]Source, 0, len(files)),
-		OwnerID:  &owner,
+		ID:         uuid.New(),
+		Client:     in.Client,
+		ERP:        in.ERP,
+		ANZSCO:     in.ANZSCO,
+		Team:       in.Team,
+		Member:     in.Member,
+		Uploader:   in.Member,
+		Status:     StatusProcessing,
+		Uploaded:   now,
+		Sources:    make([]Source, 0, len(files)),
+		OwnerID:    &owner,
+		ReviewNote: ClampNote(in.Note),
 	}
 
 	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, now)
@@ -172,7 +180,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 	return out, nil
 }
 
-func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipart.FileHeader, titles []string) (Document, error) {
+func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipart.FileHeader, titles []string, note string) (Document, error) {
 	doc, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return Document{}, err
@@ -192,7 +200,7 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 		s.cleanup(written)
 		return Document{}, err
 	}
-	if err := s.repo.InsertSources(ctx, id, written, s.maxN); err != nil {
+	if err := s.repo.InsertSources(ctx, id, written, s.maxN, note); err != nil {
 		s.cleanup(written)
 		return Document{}, err
 	}
@@ -208,11 +216,11 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 }
 
 func (s *Service) Delete(ctx context.Context, id uuid.UUID) error {
-	doc, err := s.repo.Get(ctx, id)
-	if err != nil {
+	if err := s.requireAdmin(ctx); err != nil {
 		return err
 	}
-	if err := s.canWrite(ctx, doc); err != nil {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
 		return err
 	}
 	keys, err := s.repo.Delete(ctx, id)

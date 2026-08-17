@@ -53,7 +53,8 @@ func (r *Repo) List(ctx context.Context, filter ListFilter) ([]Document, error) 
 		return nil, err
 	}
 	query := `
-		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id
+		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id,
+		       review_note, review_requested_at
 		FROM documents`
 	args := []any{}
 	switch {
@@ -76,13 +77,9 @@ func (r *Repo) List(ctx context.Context, filter ListFilter) ([]Document, error) 
 	byID := make(map[uuid.UUID]*Document, 64)
 	for rows.Next() {
 		var d Document
-		var owner uuid.NullUUID
-		if err := rows.Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded, &owner); err != nil {
+		if err := scanDocument(rows, &d); err != nil {
 			return nil, err
 		}
-		d.Member = strings.TrimSpace(d.Member)
-		d.Uploader = d.Member
-		d.OwnerID = nullUUID(owner)
 		d.Sources = []Source{}
 		docs = append(docs, d)
 		ids = append(ids, d.ID)
@@ -109,19 +106,16 @@ func (r *Repo) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 		return Document{}, err
 	}
 	var d Document
-	var owner uuid.NullUUID
-	err = db.QueryRow(ctx, `
-		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id
-		FROM documents WHERE id=$1`, id).
-		Scan(&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded, &owner)
+	err = scanDocument(db.QueryRow(ctx, `
+		SELECT id, client, erp, anzsco, team, member, status, created_at, owner_id,
+		       review_note, review_requested_at
+		FROM documents WHERE id=$1`, id), &d)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Document{}, ErrNotFound
 	}
 	if err != nil {
 		return Document{}, err
 	}
-	d.Uploader = d.Member
-	d.OwnerID = nullUUID(owner)
 	d.Sources = []Source{}
 	byID := map[uuid.UUID]*Document{d.ID: &d}
 	if err := r.attachSources(ctx, db, []uuid.UUID{d.ID}, byID); err != nil {
@@ -213,9 +207,9 @@ func (r *Repo) attachSources(ctx context.Context, db *pgxpool.Pool, ids []uuid.U
 func (r *Repo) InsertDocument(ctx context.Context, d Document) error {
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO documents (id, client, erp, anzsco, team, member, status, created_at, updated_at, owner_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)`,
-			d.ID, d.Client, d.ERP, d.ANZSCO, d.Team, d.Member, d.Status, d.Uploaded, d.OwnerID)
+			INSERT INTO documents (id, client, erp, anzsco, team, member, status, created_at, updated_at, owner_id, review_note)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)`,
+			d.ID, d.Client, d.ERP, d.ANZSCO, d.Team, d.Member, d.Status, d.Uploaded, d.OwnerID, d.ReviewNote)
 		if isUniqueViolation(err) {
 			return ErrERPTaken
 		}
@@ -234,10 +228,11 @@ func (r *Repo) InsertDocument(ctx context.Context, d Document) error {
 	})
 }
 
-func (r *Repo) InsertSources(ctx context.Context, documentID uuid.UUID, sources []Source, maxSources int) error {
+func (r *Repo) InsertSources(ctx context.Context, documentID uuid.UUID, sources []Source, maxSources int, note string) error {
 	if maxSources < 1 {
 		maxSources = 4
 	}
+	note = ClampNote(note)
 	return r.withTx(ctx, func(tx pgx.Tx) error {
 		var id uuid.UUID
 		err := tx.QueryRow(ctx, `SELECT id FROM documents WHERE id=$1 FOR UPDATE`, documentID).Scan(&id)
@@ -261,6 +256,15 @@ func (r *Repo) InsertSources(ctx context.Context, documentID uuid.UUID, sources 
 				s.ID, documentID, s.Title, s.StorageKey, s.ContentType, s.SizeBytes, s.Uniqueness, s.Uploaded); err != nil {
 				return err
 			}
+		}
+		if note != "" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE documents
+				SET status='processing', notified_at=NULL, review_note=$2, updated_at=now()
+				WHERE id=$1`, documentID, note); err != nil {
+				return err
+			}
+			return nil
 		}
 		_, err = tx.Exec(ctx, `UPDATE documents SET status='processing', notified_at=NULL, updated_at=now() WHERE id=$1`, documentID)
 		return err
@@ -543,6 +547,25 @@ func decorate(d *Document) {
 	for i := range d.Sources {
 		d.Sources[i].FileURL = fileURL(d.ID, d.Sources[i].ID)
 	}
+}
+
+type documentScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDocument(row documentScanner, d *Document) error {
+	var owner uuid.NullUUID
+	if err := row.Scan(
+		&d.ID, &d.Client, &d.ERP, &d.ANZSCO, &d.Team, &d.Member, &d.Status, &d.Uploaded, &owner,
+		&d.ReviewNote, &d.ReviewRequestedAt,
+	); err != nil {
+		return err
+	}
+	d.Member = strings.TrimSpace(d.Member)
+	d.Uploader = d.Member
+	d.OwnerID = nullUUID(owner)
+	d.ReviewNote = strings.TrimSpace(d.ReviewNote)
+	return nil
 }
 
 func fileURL(docID, sourceID uuid.UUID) string {

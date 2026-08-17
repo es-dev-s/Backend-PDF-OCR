@@ -189,6 +189,59 @@ func (s *Server) rejectReview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) uploadStats(w http.ResponseWriter, r *http.Request) {
+	from, to, err := parseStatsRange(r)
+	if err != nil {
+		writeErrCode(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	stats, err := s.docs.UploadStats(r.Context(), from, to)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
+func parseStatsRange(r *http.Request) (time.Time, time.Time, error) {
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	toInclusive := today
+	from := today.AddDate(0, 0, -29)
+
+	var err error
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		toInclusive, err = parseUTCDate(raw)
+		if err != nil {
+			return time.Time{}, time.Time{}, errors.New("invalid to date")
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		from, err = parseUTCDate(raw)
+		if err != nil {
+			return time.Time{}, time.Time{}, errors.New("invalid from date")
+		}
+	} else {
+		from = toInclusive.AddDate(0, 0, -29)
+	}
+	if toInclusive.Before(from) {
+		return time.Time{}, time.Time{}, errors.New("to must be on or after from")
+	}
+	toExclusive := toInclusive.AddDate(0, 0, 1)
+	if toExclusive.Sub(from) > 366*24*time.Hour {
+		return time.Time{}, time.Time{}, errors.New("range cannot exceed 366 days")
+	}
+	return from, toExclusive, nil
+}
+
+func parseUTCDate(raw string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02", raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
+}
+
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, expires time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.CookieName,

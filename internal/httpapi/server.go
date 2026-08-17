@@ -129,6 +129,7 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/reviews", s.listReviews)
 				r.Post("/reviews/{id}/approve", s.approveReview)
 				r.Post("/reviews/{id}/reject", s.rejectReview)
+				r.Get("/stats/uploads", s.uploadStats)
 			})
 		})
 	})
@@ -364,7 +365,7 @@ func (s *Server) addSources(w http.ResponseWriter, r *http.Request) {
 		writeErrCode(w, http.StatusBadRequest, "invalid", err.Error())
 		return
 	}
-	doc, err := s.docs.AddSources(r.Context(), id, files, in.Titles)
+	doc, err := s.docs.AddSources(r.Context(), id, files, in.Titles, in.Note)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -544,6 +545,7 @@ func parseUpload(w http.ResponseWriter, r *http.Request, cfg config.Config) (doc
 		ANZSCO: r.FormValue("anzsco"),
 		Team:   r.FormValue("team"),
 		Member: r.FormValue("member"),
+		Note:   r.FormValue("note"),
 	}
 	var files []*multipart.FileHeader
 	if r.MultipartForm != nil {

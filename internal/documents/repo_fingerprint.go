@@ -244,6 +244,16 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 						THEN 'duplicate'
 					ELSE 'completed'
 				END,
+				review_requested_at = CASE
+					WHEN EXISTS (
+						SELECT 1 FROM sources s
+						WHERE s.document_id = d.id
+						  AND s.uniqueness = 'duplicate'
+						  AND s.released = FALSE
+					)
+						THEN COALESCE(d.review_requested_at, now())
+					ELSE d.review_requested_at
+				END,
 				updated_at = now()
 			WHERE d.id = ANY($1)`, ids); err != nil {
 			return err

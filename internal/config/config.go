@@ -66,7 +66,7 @@ func Load() (Config, error) {
 		MaxInflightUploads: int(envInt64("MAX_INFLIGHT_UPLOADS", 8)),
 		Heartbeat:          time.Duration(envInt64("HEARTBEAT_SECONDS", 2)) * time.Second,
 		ShutdownTimeout:    time.Duration(envInt64("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
-		EngineURL:          env("ENGINE_BASE_URL", "http://127.0.0.1:8000"),
+		EngineURL:          normalizeEngineURL(env("ENGINE_BASE_URL", "http://127.0.0.1:8000")),
 		AdminEmail:         env("AUTH_ADMIN_EMAIL", ""),
 		AdminPassword:      env("AUTH_ADMIN_PASSWORD", ""),
 		AdminName:          env("AUTH_ADMIN_NAME", "Admin"),
@@ -128,6 +128,27 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// normalizeEngineURL accepts a host or a full URL. Production hostnames
+// without a scheme become https:// so Railway-style values cannot silently
+// talk plaintext. Local loopback stays http.
+func normalizeEngineURL(raw string) string {
+	s := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if s == "" {
+		return "http://127.0.0.1:8000"
+	}
+	if strings.Contains(s, "://") {
+		return s
+	}
+	host := s
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		host = s[:i]
+	}
+	if strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1") {
+		return "http://" + s
+	}
+	return "https://" + s
 }
 
 func hosted() bool {

@@ -9,7 +9,8 @@ import (
 	"unicode/utf8"
 )
 
-const maxReviewNote = 500
+const maxNoteEntry = 500
+const maxNoteLog = 4000
 
 func ClampNote(raw string) string {
 	s := strings.TrimSpace(raw)
@@ -19,21 +20,90 @@ func ClampNote(raw string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	n := 0
+	prevSpace := false
 	for _, r := range s {
-		if r != '\n' && r != '\t' && unicode.IsControl(r) {
+		if r == '\n' || r == '\r' || r == '\t' {
+			r = ' '
+		}
+		if unicode.IsControl(r) {
 			continue
 		}
-		if n >= maxReviewNote {
+		if r == ' ' {
+			if prevSpace || n == 0 {
+				continue
+			}
+			prevSpace = true
+		} else {
+			prevSpace = false
+		}
+		if n >= maxNoteEntry {
 			break
 		}
 		b.WriteRune(r)
 		n++
 	}
 	out := strings.TrimSpace(b.String())
-	if utf8.RuneCountInString(out) > maxReviewNote {
-		out = string([]rune(out)[:maxReviewNote])
+	if utf8.RuneCountInString(out) > maxNoteEntry {
+		out = string([]rune(out)[:maxNoteEntry])
 	}
 	return out
+}
+
+func mergeNoteLog(chunks ...string) string {
+	seen := make(map[string]struct{}, len(chunks))
+	parts := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		for _, line := range strings.Split(chunk, "\n") {
+			line = ClampNote(line)
+			if line == "" {
+				continue
+			}
+			if _, ok := seen[line]; ok {
+				continue
+			}
+			seen[line] = struct{}{}
+			parts = append(parts, line)
+		}
+	}
+	var b strings.Builder
+	n := 0
+	for i, part := range parts {
+		extra := utf8.RuneCountInString(part)
+		if i > 0 {
+			extra++
+		}
+		if n+extra > maxNoteLog {
+			break
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(part)
+		n += extra
+	}
+	return b.String()
+}
+
+func joinSourceNotes(sources []Source) string {
+	chunks := make([]string, 0, len(sources))
+	for _, src := range sources {
+		chunks = append(chunks, src.Note)
+	}
+	return mergeNoteLog(chunks...)
+}
+
+func mergeReviewNote(existing, added string) string {
+	return mergeNoteLog(existing, added)
+}
+
+func noteForFile(notes []string, i int, fallback string) string {
+	if i < len(notes) {
+		return ClampNote(notes[i])
+	}
+	if len(notes) == 0 {
+		return ClampNote(fallback)
+	}
+	return ""
 }
 
 func (r *Repo) UploadStats(ctx context.Context, from, to time.Time) (UploadStats, error) {

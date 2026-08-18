@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
@@ -91,6 +92,53 @@ func (r *Repo) Create(ctx context.Context, title, detail string) error {
 
 func (r *Repo) NotifyAdmins(ctx context.Context, title, detail, kind string, docID *uuid.UUID) error {
 	return r.insert(ctx, nil, "admin", title, detail, kind, docID)
+}
+
+func (r *Repo) NotifyAdminsOnce(ctx context.Context, title, detail, kind string, docID uuid.UUID) error {
+	db, err := r.db()
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, kindLock(docID, kind)); err != nil {
+		return err
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notifications
+			WHERE document_id = $1 AND kind = $2 AND "read" = false
+		)`, docID, kind).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	item := Item{
+		ID:         uuid.New(),
+		Title:      title,
+		Detail:     detail,
+		Created:    time.Now().UTC(),
+		Audience:   "admin",
+		Kind:       kind,
+		DocumentID: &docID,
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO notifications (id, title, detail, "read", created_at, user_id, audience, kind, document_id)
+		VALUES ($1,$2,$3,false,$4,NULL,$5,$6,$7)`, item.ID, item.Title, item.Detail, item.Created, item.Audience, item.Kind, docID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if r.hub != nil {
+		r.hub.Publish(ctx, "notification.created", item)
+	}
+	return nil
 }
 
 func (r *Repo) NotifyUser(ctx context.Context, userID uuid.UUID, title, detail, kind string, docID *uuid.UUID) error {
@@ -199,4 +247,11 @@ func asUUID(v uuid.NullUUID) *uuid.UUID {
 	}
 	id := v.UUID
 	return &id
+}
+
+func kindLock(docID uuid.UUID, kind string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write(docID[:])
+	_, _ = h.Write([]byte(kind))
+	return int64(h.Sum64())
 }

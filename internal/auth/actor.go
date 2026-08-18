@@ -69,7 +69,7 @@ func TokenFromRequest(r *http.Request) string {
 	if c, err := r.Cookie(CookieName); err == nil {
 		return strings.TrimSpace(c.Value)
 	}
-	return strings.TrimSpace(r.URL.Query().Get("access_token"))
+	return ""
 }
 
 func NormalizeEmail(email string) string {

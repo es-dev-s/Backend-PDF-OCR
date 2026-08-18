@@ -2,8 +2,14 @@ package documents
 
 import (
 	"context"
+	"errors"
+	"mime/multipart"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+
+	"ocr-backend/internal/auth"
 )
 
 func newLimitedService(heavy, title int) *Service {
@@ -101,5 +107,31 @@ func TestTrimMemoryIsRateLimited(t *testing.T) {
 	// 200 stop-the-world collections would take far longer than this.
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("trimMemory was not throttled: %s", elapsed)
+	}
+}
+
+func TestCreateRejectsMoreThanMaxSources(t *testing.T) {
+	s := newLimitedService(1, 1)
+	files := make([]*multipart.FileHeader, 5)
+	ctx := auth.WithUser(context.Background(), auth.User{ID: uuid.New(), Name: "Ada"})
+	_, err := s.Create(ctx, CreateInput{
+		Client: "Acme",
+		ERP:    "ERP-10001",
+		Member: "Ada",
+	}, files)
+	if !errors.Is(err, ErrTooMany) {
+		t.Fatalf("got %v want ErrTooMany", err)
+	}
+}
+
+func TestTitleRetryDelayGrowsThenCaps(t *testing.T) {
+	if titleRetryDelay(1) != 20*time.Second {
+		t.Fatalf("first retry: %s", titleRetryDelay(1))
+	}
+	if titleRetryDelay(6) != 30*time.Minute {
+		t.Fatalf("cap: %s", titleRetryDelay(6))
+	}
+	if titleRetryDelay(99) != 30*time.Minute {
+		t.Fatalf("beyond cap: %s", titleRetryDelay(99))
 	}
 }

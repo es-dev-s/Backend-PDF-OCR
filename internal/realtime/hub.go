@@ -43,7 +43,7 @@ func NewHub(rdb *redisx.Client, log *slog.Logger) *Hub {
 func (h *Hub) ID() string { return h.id }
 
 func (h *Hub) Subscribe(buf int) (<-chan []byte, func()) {
-	if buf < 8 {
+	if buf < 1 {
 		buf = 32
 	}
 	ch := make(chan []byte, buf)
@@ -55,6 +55,22 @@ func (h *Hub) Subscribe(buf int) (<-chan []byte, func()) {
 		delete(h.subs, ch)
 		h.mu.Unlock()
 		// Never close(ch): a concurrent broadcast could send on a closed channel.
+	}
+}
+
+func sendLatest(ch chan []byte, raw []byte) {
+	select {
+	case ch <- raw:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- raw:
+	default:
 	}
 }
 
@@ -153,9 +169,6 @@ func (h *Hub) broadcast(raw []byte) {
 	}
 	h.mu.RUnlock()
 	for _, ch := range subs {
-		select {
-		case ch <- raw:
-		default:
-		}
+		sendLatest(ch, raw)
 	}
 }

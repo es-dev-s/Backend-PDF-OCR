@@ -292,7 +292,7 @@ func (r *Repo) FinalizeFingerprint(ctx context.Context, src Source, fp fingerpri
 func queryExact(ctx context.Context, q querier, except uuid.UUID, sha string) ([]HashMatch, error) {
 	rows, err := q.Query(ctx, `
 		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at,
-		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
+		       COALESCE(NULLIF(TRIM(s.note), ''), NULLIF(TRIM(d.review_note), ''), '')
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.content_sha256 = $1 AND s.id <> $2
@@ -307,7 +307,7 @@ func queryExact(ctx context.Context, q querier, except uuid.UUID, sha string) ([
 func queryTextExact(ctx context.Context, q querier, except uuid.UUID, norm string) ([]HashMatch, error) {
 	rows, err := q.Query(ctx, `
 		SELECT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at, s.page_count,
-		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
+		       COALESCE(NULLIF(TRIM(s.note), ''), NULLIF(TRIM(d.review_note), ''), '')
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.text_norm_sha256 = $1 AND s.id <> $2
@@ -378,7 +378,7 @@ func queryLSH(ctx context.Context, q querier, except uuid.UUID, kind string, has
 func lshQuery(hashCol string) string {
 	return `
 		SELECT DISTINCT s.id, s.document_id, s.title, d.erp, d.client, d.anzsco, d.team, d.member, s.uniqueness, s.created_at, s.page_count, ` + hashCol + `,
-		       CASE WHEN s.uniqueness = 'duplicate' THEN COALESCE(s.note, '') ELSE '' END
+		       COALESCE(NULLIF(TRIM(s.note), ''), NULLIF(TRIM(d.review_note), ''), '')
 		FROM fingerprint_lsh l
 		JOIN sources s ON s.id = l.source_id
 		JOIN documents d ON d.id = s.document_id
@@ -584,5 +584,57 @@ func (r *Repo) PreviewFingerprint(ctx context.Context, fp fingerprint.Result) ([
 		}
 		return matches[i].Uploaded.Before(matches[j].Uploaded)
 	})
-	return confidentMatches(fp, matches), nil
+	matches = confidentMatches(fp, matches)
+	if merged := mergeNoteLog(append(notesOf(matches), clusterNotes(ctx, db, fp, matches)...)...); merged != "" {
+		for i := range matches {
+			matches[i].Note = merged
+		}
+	}
+	return matches, nil
+}
+
+func clusterNotes(ctx context.Context, q querier, fp fingerprint.Result, matches []HashMatch) []string {
+	ids := make([]uuid.UUID, 0, len(matches))
+	seen := make(map[uuid.UUID]struct{}, len(matches))
+	for _, m := range matches {
+		if _, ok := seen[m.SourceID]; ok {
+			continue
+		}
+		seen[m.SourceID] = struct{}{}
+		ids = append(ids, m.SourceID)
+	}
+	if fp.SHA256 == "" && len(ids) == 0 {
+		return nil
+	}
+	rows, err := q.Query(ctx, `
+		SELECT COALESCE(s.note, ''), COALESCE(d.review_note, '')
+		FROM sources s
+		JOIN documents d ON d.id = s.document_id
+		WHERE (
+		        ($1 <> '' AND s.content_sha256 = $1)
+		        OR s.id = ANY($2)
+		      )
+		  AND (COALESCE(s.note, '') <> '' OR COALESCE(d.review_note, '') <> '')
+		ORDER BY s.created_at ASC, s.id ASC`, fp.SHA256, ids)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var note, review string
+		if err := rows.Scan(&note, &review); err != nil {
+			return out
+		}
+		out = append(out, note, review)
+	}
+	return out
+}
+
+func notesOf(matches []HashMatch) []string {
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, m.Note)
+	}
+	return out
 }

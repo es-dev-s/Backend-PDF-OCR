@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,18 +48,27 @@ type Client struct {
 	base     string
 	http     *http.Client
 	sem      chan struct{}
+	fast     chan struct{}
+	fastLive atomic.Int32
 	log      *slog.Logger
 	mu       sync.Mutex
 	cached   string
 	cachedAt time.Time
 }
 
-func New(base string, log *slog.Logger) *Client {
+func New(base string, log *slog.Logger, limit, interactive int) *Client {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if limit < 1 {
+		limit = 1
+	}
+	if interactive < 1 {
+		interactive = 2
+	}
 	return &Client{
 		base: base,
 		http: &http.Client{Timeout: 0},
-		sem:  make(chan struct{}, 1),
+		sem:  make(chan struct{}, limit),
+		fast: make(chan struct{}, interactive),
 		log:  log,
 	}
 }
@@ -105,18 +115,55 @@ func (c *Client) store(v string) string {
 }
 
 func (c *Client) Title(ctx context.Context, filename string, r io.Reader) (Result, error) {
+	return c.title(ctx, filename, r, c.sem)
+}
+
+// TitleNow is the form path: it never waits on background title workers.
+func (c *Client) TitleNow(ctx context.Context, filename string, r io.Reader) (Result, error) {
+	return c.title(ctx, filename, r, c.fast)
+}
+
+func (c *Client) InteractiveBusy() bool {
+	return c != nil && c.fastLive.Load() > 0
+}
+
+func (c *Client) yieldForInteractive(ctx context.Context) error {
+	for c.fastLive.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(40 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
+func (c *Client) title(ctx context.Context, filename string, r io.Reader, gate chan struct{}) (Result, error) {
 	var out Result
 	if !c.Configured() {
 		return out, fmt.Errorf("engine is not configured")
+	}
+	if gate == nil {
+		gate = c.sem
+	}
+	quick := gate == c.fast
+	if quick {
+		c.fastLive.Add(1)
+		defer c.fastLive.Add(-1)
 	}
 	var payload bytes.Buffer
 	payload.Grow(MaxTitleBytes + 64)
 	if _, err := io.Copy(&payload, io.LimitReader(r, MaxTitleBytes)); err != nil {
 		return out, err
 	}
+	if !quick {
+		if err := c.yieldForInteractive(ctx); err != nil {
+			return out, err
+		}
+	}
 	select {
-	case c.sem <- struct{}{}:
-		defer func() { <-c.sem }()
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
 	case <-ctx.Done():
 		return out, ctx.Err()
 	}
@@ -127,10 +174,15 @@ func (c *Client) Title(ctx context.Context, filename string, r io.Reader) (Resul
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
+		if !quick {
+			if err := c.yieldForInteractive(ctx); err != nil {
+				return out, err
+			}
+		}
 		if _, err := src.Seek(0, io.SeekStart); err != nil {
 			return out, err
 		}
-		res, retryAfter, err := c.roundTrip(ctx, filename, src)
+		res, retryAfter, err := c.roundTrip(ctx, filename, src, quick)
 		if err == nil {
 			return res, nil
 		}
@@ -152,7 +204,7 @@ func (c *Client) Title(ctx context.Context, filename string, r io.Reader) (Resul
 	return out, last
 }
 
-func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (Result, time.Duration, error) {
+func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader, quick bool) (Result, time.Duration, error) {
 	var out Result
 	var buf bytes.Buffer
 	buf.Grow(MaxTitleBytes + 4096)
@@ -190,6 +242,12 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader) (R
 			if n, err := strconv.Atoi(ra); err == nil && n > 0 {
 				wait = time.Duration(n) * time.Second
 			}
+		}
+		if quick {
+			// Form titles must fail fast so the UI can retry. A 60s Retry-After
+			// is what made "Generating title…" hang while a direct engine call
+			// still returned in about a second.
+			return out, 0, fmt.Errorf("engine rate limited")
 		}
 		return out, wait, fmt.Errorf("engine rate limited")
 	}
@@ -256,8 +314,16 @@ func SanitizeTitle(s string) string {
 	return out
 }
 
+func stripPDFExt(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 4 && strings.EqualFold(s[len(s)-4:], ".pdf") {
+		return strings.TrimSpace(s[:len(s)-4])
+	}
+	return s
+}
+
 func PrintedTitle(s string) string {
-	out := SanitizeTitle(s)
+	out := SanitizeTitle(stripPDFExt(s))
 	if out == "" {
 		return ""
 	}
@@ -284,6 +350,21 @@ func DisplayName(res Result) string {
 	return UntitledDocument
 }
 
+// TitleSettled is true when the engine result should stop retrying:
+// a printed heading, or a scan that cannot be read.
+func TitleSettled(name string) bool {
+	if PrintedTitle(name) != "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(name), UnreadableTitle)
+}
+
+// IsPlaceholder is a title that must not be stored as final and must stay
+// in the extraction queue: empty, Untitled, or a .pdf filename.
+func IsPlaceholder(s string) bool {
+	return !TitleSettled(s)
+}
+
 // PublicTitle is what the API and UI may show. Never a .pdf upload name.
 func PublicTitle(s string) string {
 	s = strings.TrimSpace(s)
@@ -297,8 +378,13 @@ func PublicTitle(s string) string {
 }
 
 func looksLikeFilename(s string) bool {
-	lower := strings.ToLower(strings.TrimSpace(s))
-	return strings.HasSuffix(lower, ".pdf")
+	s = stripPDFExt(s)
+	if s == "" {
+		return true
+	}
+	// Paper headings have spaces. A single slug, with or without .pdf, is an
+	// upload name (notes.pdf, 3.Our.ME_Project_Study_2) and must not be stored.
+	return !strings.Contains(s, " ")
 }
 
 func parseEngineDetail(body []byte, status int) string {

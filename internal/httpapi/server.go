@@ -105,6 +105,9 @@ func (s *Server) Handler() http.Handler {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/auth/login", s.login)
 		r.Post("/auth/logout", s.logout)
+		r.Get("/public/documents/{id}", s.getPublicDocument)
+		r.Get("/public/documents/{id}/sources/{sid}/file", s.getPublicFile)
+		r.Head("/public/documents/{id}/sources/{sid}/file", s.getPublicFile)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireAuth)
 			r.Get("/auth/me", s.me)
@@ -240,6 +243,7 @@ func (s *Server) healthStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Content-Encoding", "identity")
 	tick := time.NewTicker(s.cfg.Heartbeat)
 	defer tick.Stop()
 	writeSSE(w, flusher, "status", s.snapshot(r.Context()))
@@ -263,7 +267,8 @@ func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	ch, cancel := s.hub.Subscribe(64)
+	w.Header().Set("Content-Encoding", "identity")
+	ch, cancel := s.hub.Subscribe(256)
 	defer cancel()
 	writeSSE(w, flusher, "hello", map[string]string{"ok": "true"})
 	keep := time.NewTicker(15 * time.Second)
@@ -365,7 +370,7 @@ func (s *Server) addSources(w http.ResponseWriter, r *http.Request) {
 		writeErrCode(w, http.StatusBadRequest, "invalid", err.Error())
 		return
 	}
-	doc, err := s.docs.AddSources(r.Context(), id, files, in.Titles, in.Note)
+	doc, err := s.docs.AddSources(r.Context(), id, files, in.Titles, in.Notes, in.Note)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -386,7 +391,29 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) getPublicDocument(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid id")
+		return
+	}
+	doc, err := s.docs.PublicGet(r.Context(), id)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, doc)
+}
+
 func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
+	s.serveSourceFile(w, r, false)
+}
+
+func (s *Server) getPublicFile(w http.ResponseWriter, r *http.Request) {
+	s.serveSourceFile(w, r, true)
+}
+
+func (s *Server) serveSourceFile(w http.ResponseWriter, r *http.Request, public bool) {
 	docID, err := parseID(chi.URLParam(r, "id"))
 	if err != nil {
 		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid id")
@@ -397,7 +424,11 @@ func (s *Server) getFile(w http.ResponseWriter, r *http.Request) {
 		writeErrCode(w, http.StatusBadRequest, "invalid", "invalid id")
 		return
 	}
-	f, _, ctype, name, mod, err := s.docs.OpenFile(r.Context(), docID, sid)
+	open := s.docs.OpenFile
+	if public {
+		open = s.docs.PublicOpenFile
+	}
+	f, _, ctype, name, mod, err := open(r.Context(), docID, sid)
 	if err != nil {
 		s.writeErr(w, err)
 		return
@@ -458,17 +489,17 @@ func (s *Server) inspectFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) suggestTitle(w http.ResponseWriter, r *http.Request) {
-	if !s.acquireUpload(r.Context()) {
-		s.writeBusy(w)
-		return
-	}
-	defer s.releaseUpload()
 	fh, f, ok := openOneUpload(w, r, s.cfg.MaxUploadBytes)
 	if !ok {
 		return
 	}
 	defer f.Close()
-	writeJSON(w, http.StatusOK, s.docs.SuggestTitle(r.Context(), fh.Filename, f))
+	res, err := s.docs.SuggestTitle(r.Context(), fh.Filename, f)
+	if err != nil {
+		s.writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func openOneUpload(w http.ResponseWriter, r *http.Request, max int64) (*multipart.FileHeader, multipart.File, bool) {
@@ -505,6 +536,9 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, context.DeadlineExceeded):
 		writeErrCode(w, http.StatusGatewayTimeout, "timeout", "request timed out")
 		return
+	case errors.Is(err, documents.ErrEngineBusy):
+		s.writeBusy(w)
+		return
 	case errors.Is(err, documents.ErrUnavailable):
 		writeErrCode(w, http.StatusServiceUnavailable, "unavailable", "postgres is unavailable")
 	case errors.Is(err, documents.ErrNotFound), errors.Is(err, blob.ErrNotFound):
@@ -517,6 +551,8 @@ func (s *Server) writeErr(w http.ResponseWriter, err error) {
 		writeErrCode(w, http.StatusBadRequest, "no_files", "at least one file is required")
 	case errors.Is(err, documents.ErrTooMany):
 		writeErrCode(w, http.StatusBadRequest, "too_many", "source limit reached")
+	case errors.Is(err, documents.ErrTooLarge):
+		writeErrCode(w, http.StatusBadRequest, "too_large", "file too large")
 	case errors.Is(err, auth.ErrUnauthorized), errors.Is(err, auth.ErrInvalidCreds):
 		writeErrCode(w, http.StatusUnauthorized, "unauthorized", "sign in required")
 	case errors.Is(err, auth.ErrForbidden), errors.Is(err, documents.ErrForbidden):
@@ -554,6 +590,7 @@ func parseUpload(w http.ResponseWriter, r *http.Request, cfg config.Config) (doc
 		files = append(files, r.MultipartForm.File["files[]"]...)
 		in.Titles = append(in.Titles, r.MultipartForm.Value["titles"]...)
 		in.Titles = append(in.Titles, r.MultipartForm.Value["title"]...)
+		in.Notes = append(in.Notes, r.MultipartForm.Value["notes"]...)
 	}
 	return in, files, nil
 }
@@ -563,7 +600,9 @@ func parseID(raw string) (uuid.UUID, error) {
 }
 
 func safeDownloadName(name, ctype string) string {
-	base := filepath.Base(strings.ReplaceAll(strings.TrimSpace(name), "\\", "/"))
+	raw := strings.ReplaceAll(strings.TrimSpace(name), "\\", "/")
+	raw = strings.ReplaceAll(raw, "/", "-")
+	base := filepath.Base(raw)
 	var b strings.Builder
 	for _, r := range base {
 		if r < 32 || r == '"' || unicode.IsControl(r) {

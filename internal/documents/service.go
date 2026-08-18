@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"ocr-backend/internal/fingerprint"
 	"ocr-backend/internal/realtime"
 	"ocr-backend/internal/retry"
+	"ocr-backend/internal/titlesim"
 	"ocr-backend/internal/worker"
 )
 
@@ -34,24 +36,26 @@ type Notifier interface {
 	Create(ctx context.Context, title, detail string) error
 	NotifyUser(ctx context.Context, userID uuid.UUID, title, detail, kind string, docID *uuid.UUID) error
 	NotifyAdmins(ctx context.Context, title, detail, kind string, docID *uuid.UUID) error
+	NotifyAdminsOnce(ctx context.Context, title, detail, kind string, docID uuid.UUID) error
 	HasUnreadKind(ctx context.Context, docID uuid.UUID, kind string) bool
 }
 
 type Service struct {
-	repo    *Repo
-	blob    blob.Store
-	hub     *realtime.Hub
-	pool    *worker.Pool
-	notes   Notifier
-	engine  *engine.Client
-	log     *slog.Logger
-	maxN    int
-	maxB    int64
-	hashing sync.Map
-	titling sync.Map
-	heavy   chan struct{}
-	titles  chan struct{}
-	put     chan struct{}
+	repo       *Repo
+	blob       blob.Store
+	hub        *realtime.Hub
+	pool       *worker.Pool
+	notes      Notifier
+	engine     *engine.Client
+	log        *slog.Logger
+	maxN       int
+	maxB       int64
+	hashing    sync.Map
+	titling    sync.Map
+	similaring sync.Map
+	heavy      chan struct{}
+	titles     chan struct{}
+	put        chan struct{}
 
 	trimmedAt atomic.Int64
 }
@@ -120,6 +124,17 @@ func (s *Service) Get(ctx context.Context, id uuid.UUID) (Document, error) {
 	return doc, nil
 }
 
+func (s *Service) PublicGet(ctx context.Context, id uuid.UUID) (Document, error) {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return Document{}, err
+	}
+	if err := PublicView(&doc); err != nil {
+		return Document{}, err
+	}
+	return doc, nil
+}
+
 const firstERP = 10001
 
 func (s *Service) NextERP(ctx context.Context) (string, error) {
@@ -150,7 +165,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		return Document{}, ErrNoFiles
 	}
 	if len(files) > s.maxN {
-		files = files[:s.maxN]
+		return Document{}, ErrTooMany
 	}
 
 	now := time.Now().UTC()
@@ -170,19 +185,23 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 		ReviewNote: ClampNote(in.Note),
 	}
 
-	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, doc.ReviewNote, now)
+	written, err := s.storeFiles(ctx, doc.ID, files, in.Titles, in.Notes, in.Note, now)
 	if err != nil {
 		s.cleanup(written)
 		return Document{}, err
 	}
 	doc.Sources = written
+	if joined := joinSourceNotes(written); joined != "" {
+		doc.ReviewNote = joined
+	}
 	if err := s.repo.InsertDocument(ctx, doc); err != nil {
 		s.cleanup(written)
 		return Document{}, err
 	}
 	bg := s.jobContext()
 	s.enqueueHash(bg, written)
-	s.enqueueTitle(bg, written)
+	s.enqueueTitle(bg, written, false)
+	s.enqueueSimilar(bg, written, false)
 	out, err := s.repo.Get(ctx, doc.ID)
 	if err != nil {
 		return Document{}, err
@@ -191,7 +210,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput, files []*multipart
 	return out, nil
 }
 
-func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipart.FileHeader, titles []string, note string) (Document, error) {
+func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipart.FileHeader, titles, notes []string, note string) (Document, error) {
 	doc, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return Document{}, err
@@ -202,22 +221,23 @@ func (s *Service) AddSources(ctx context.Context, id uuid.UUID, files []*multipa
 	if len(files) == 0 {
 		return Document{}, ErrNoFiles
 	}
-	if len(files) > s.maxN {
-		files = files[:s.maxN]
+	if len(files) > s.maxN || len(doc.Sources)+len(files) > s.maxN {
+		return Document{}, ErrTooMany
 	}
 	now := time.Now().UTC()
-	written, err := s.storeFiles(ctx, id, files, titles, note, now)
+	written, err := s.storeFiles(ctx, id, files, titles, notes, note, now)
 	if err != nil {
 		s.cleanup(written)
 		return Document{}, err
 	}
-	if err := s.repo.InsertSources(ctx, id, written, s.maxN, note); err != nil {
+	if err := s.repo.InsertSources(ctx, id, written, s.maxN, joinSourceNotes(written)); err != nil {
 		s.cleanup(written)
 		return Document{}, err
 	}
 	bg := s.jobContext()
 	s.enqueueHash(bg, written)
-	s.enqueueTitle(bg, written)
+	s.enqueueTitle(bg, written, false)
+	s.enqueueSimilar(bg, written, false)
 	out, err := s.repo.Get(ctx, id)
 	if err != nil {
 		return Document{}, err
@@ -325,7 +345,7 @@ func (s *Service) canWrite(ctx context.Context, doc Document) error {
 }
 
 func (s *Service) notifyReview(ctx context.Context, doc Document) {
-	if s.notes.HasUnreadKind(ctx, doc.ID, "review") {
+	if s.notes == nil {
 		return
 	}
 	name := label(doc)
@@ -333,7 +353,7 @@ func (s *Service) notifyReview(ctx context.Context, doc Document) {
 	if who == "" {
 		who = "A member"
 	}
-	_ = s.notes.NotifyAdmins(ctx, "Duplicate needs review", fmt.Sprintf("%s · %s submitted a duplicate. Open Review to approve or decline.", name, who), "review", &doc.ID)
+	_ = s.notes.NotifyAdminsOnce(ctx, "Duplicate needs review", fmt.Sprintf("%s · %s submitted a duplicate. Open Review to approve or decline.", name, who), "review", doc.ID)
 	if doc.OwnerID != nil {
 		_ = s.notes.NotifyUser(ctx, *doc.OwnerID, "Waiting for review", fmt.Sprintf("%s is on hold until an admin reviews this duplicate.", name), "review_pending", &doc.ID)
 	}
@@ -359,6 +379,21 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 	if err := s.canRead(ctx, doc); err != nil {
 		return nil, 0, "", "", time.Time{}, err
 	}
+	return s.openStoredFile(ctx, docID, sourceID)
+}
+
+func (s *Service) PublicOpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.File, int64, string, string, time.Time, error) {
+	doc, err := s.repo.Get(ctx, docID)
+	if err != nil {
+		return nil, 0, "", "", time.Time{}, err
+	}
+	if err := PublicView(&doc); err != nil {
+		return nil, 0, "", "", time.Time{}, err
+	}
+	return s.openStoredFile(ctx, docID, sourceID)
+}
+
+func (s *Service) openStoredFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.File, int64, string, string, time.Time, error) {
 	src, err := s.repo.SourceMeta(ctx, docID, sourceID)
 	if err != nil {
 		return nil, 0, "", "", time.Time{}, err
@@ -406,9 +441,9 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 			return nil, 0, "", "", time.Time{}, err
 		}
 	}
-	name := strings.TrimSpace(src.Title)
-	if name == "" {
-		name = filepath.Base(src.StorageKey)
+	name := engine.PublicTitle(src.Title)
+	if !engine.TitleSettled(name) {
+		name = "document"
 	}
 	ctype := src.ContentType
 	if ctype == "" || ctype == "application/octet-stream" {
@@ -424,11 +459,19 @@ func (s *Service) OpenFile(ctx context.Context, docID, sourceID uuid.UUID) (*os.
 // without the sweeper ever blocking on a full pool.
 const recoverBatch = 100
 
-// RecoverPending requeues rows that never finished hashing or title
-// extraction. It reports whether the batch was full, so the caller can sweep
-// again immediately instead of trickling through a large backlog.
+// RecoverPending requeues rows that never finished hashing, title
+// extraction, or similar-title matching. It reports whether the batch was
+// full, so the caller can sweep again immediately instead of trickling
+// through a large backlog.
 func (s *Service) RecoverPending(ctx context.Context) bool {
 	more := false
+	if healed, err := s.repo.HealSettledTitles(ctx); err != nil {
+		if !errors.Is(err, ErrUnavailable) {
+			s.log.Warn("heal settled titles failed", "err", err)
+		}
+	} else if healed > 0 {
+		s.log.Info("kept printed titles", "count", healed)
+	}
 	sources, err := s.repo.ListUnhashed(ctx, recoverBatch)
 	if err != nil {
 		if !errors.Is(err, ErrUnavailable) {
@@ -448,12 +491,24 @@ func (s *Service) RecoverPending(ctx context.Context) bool {
 		}
 		return more
 	}
-	if len(pendingTitles) == 0 {
+	if len(pendingTitles) > 0 {
+		s.log.Info("requeue title extraction", "count", len(pendingTitles))
+		s.enqueueTitle(ctx, pendingTitles, true)
+		more = more || len(pendingTitles) == recoverBatch
+	}
+	pendingSimilar, err := s.repo.ListNeedingSimilar(ctx, recoverBatch)
+	if err != nil {
+		if !errors.Is(err, ErrUnavailable) {
+			s.log.Warn("recover similar titles failed", "err", err)
+		}
 		return more
 	}
-	s.log.Info("requeue title extraction", "count", len(pendingTitles))
-	s.enqueueTitle(ctx, pendingTitles)
-	return more || len(pendingTitles) == recoverBatch
+	if len(pendingSimilar) == 0 {
+		return more
+	}
+	s.log.Info("requeue title similarity", "count", len(pendingSimilar))
+	s.enqueueSimilar(ctx, pendingSimilar, true)
+	return more || len(pendingSimilar) == recoverBatch
 }
 
 func (s *Service) RunRecovery(ctx context.Context) {
@@ -494,12 +549,12 @@ func recoverDelay(more bool) time.Duration {
 	if more {
 		return 5 * time.Second
 	}
-	return 60 * time.Second
+	return 15 * time.Second
 }
 
-func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*multipart.FileHeader, titles []string, note string, now time.Time) ([]Source, error) {
+func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*multipart.FileHeader, titles, notes []string, fallback string, now time.Time) ([]Source, error) {
 	out := make([]Source, len(files))
-	note = ClampNote(note)
+	fallback = ClampNote(fallback)
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(2)
 	var mu sync.Mutex
@@ -507,7 +562,7 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 		i, fh := i, fh
 		g.Go(func() error {
 			if fh.Size > s.maxB && s.maxB > 0 {
-				return fmt.Errorf("file too large")
+				return ErrTooLarge
 			}
 			srcID := uuid.New()
 			name := sanitizeName(fh.Filename)
@@ -547,9 +602,12 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 			if err := s.acquirePut(ctx); err != nil {
 				return err
 			}
+			defer s.releasePut()
 			err = s.blob.Put(ctx, key, limited, fh.Size, ctype)
-			s.releasePut()
 			if err != nil {
+				if errors.Is(err, ErrTooLarge) {
+					return ErrTooLarge
+				}
 				return err
 			}
 			rawTitle := ""
@@ -580,7 +638,7 @@ func (s *Service) storeFiles(ctx context.Context, docID uuid.UUID, files []*mult
 				Uniqueness:  Unique,
 				Uploaded:    now.Add(time.Duration(i) * time.Millisecond),
 				NeedsTitle:  isPDF && printed == "" && !unreadable,
-				Note:        note,
+				Note:        noteForFile(notes, i, fallback),
 			}
 			mu.Unlock()
 			return nil
@@ -621,12 +679,16 @@ func (s *Service) enqueueHash(ctx context.Context, sources []Source) {
 	}
 }
 
-func (s *Service) enqueueTitle(ctx context.Context, sources []Source) {
+func (s *Service) enqueueTitle(ctx context.Context, sources []Source, wait bool) {
 	if s.engine == nil || !s.engine.Configured() {
 		return
 	}
 	if s.pool == nil {
 		for _, src := range sources {
+			if engine.TitleSettled(src.Title) {
+				_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+				continue
+			}
 			if src.NeedsTitle {
 				s.titleSource(ctx, src)
 			}
@@ -634,19 +696,162 @@ func (s *Service) enqueueTitle(ctx context.Context, sources []Source) {
 		return
 	}
 	for _, src := range sources {
+		if engine.TitleSettled(src.Title) {
+			_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+			continue
+		}
 		if !src.NeedsTitle {
 			continue
 		}
 		src := src
-		if _, loaded := s.titling.Load(src.ID.String()); loaded {
+		key := src.ID.String()
+		if _, loaded := s.titling.LoadOrStore(key, struct{}{}); loaded {
 			continue
 		}
-		if err := s.pool.TrySubmit(func(jobCtx context.Context) {
-			s.titleSource(jobCtx, src)
-		}); err != nil && !errors.Is(err, worker.ErrBusy) {
-			s.log.Warn("title enqueue failed", "err", err, "source", src.ID)
+		job := func(jobCtx context.Context) {
+			defer s.titling.Delete(key)
+			s.runTitleSource(jobCtx, src)
+		}
+		var err error
+		if wait {
+			err = s.pool.Submit(ctx, job)
+		} else {
+			err = s.pool.TrySubmit(job)
+		}
+		if err != nil {
+			s.titling.Delete(key)
+			if wait || !errors.Is(err, worker.ErrBusy) {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, worker.ErrBusy) {
+					s.log.Warn("title enqueue failed", "err", err, "source", src.ID)
+				}
+			}
 		}
 	}
+}
+
+func (s *Service) enqueueSimilar(ctx context.Context, sources []Source, wait bool) {
+	if s.pool == nil {
+		for _, src := range sources {
+			if !src.NeedsTitle {
+				s.similarSource(ctx, src)
+			}
+		}
+		return
+	}
+	for _, src := range sources {
+		if src.NeedsTitle {
+			continue
+		}
+		src := src
+		key := src.ID.String()
+		if _, loaded := s.similaring.LoadOrStore(key, struct{}{}); loaded {
+			continue
+		}
+		job := func(jobCtx context.Context) {
+			defer s.similaring.Delete(key)
+			s.similarSource(jobCtx, src)
+		}
+		var err error
+		if wait {
+			err = s.pool.Submit(ctx, job)
+		} else {
+			err = s.pool.TrySubmit(job)
+		}
+		if err != nil {
+			s.similaring.Delete(key)
+			if wait || !errors.Is(err, worker.ErrBusy) {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, worker.ErrBusy) {
+					s.log.Warn("similar enqueue failed", "err", err, "source", src.ID)
+				}
+			}
+		}
+	}
+}
+
+func (s *Service) similarSource(ctx context.Context, src Source) {
+	key := src.ID.String()
+	if s.pool == nil {
+		if _, loaded := s.similaring.LoadOrStore(key, struct{}{}); loaded {
+			return
+		}
+		defer s.similaring.Delete(key)
+	}
+
+	norm := titlesim.Normalize(src.Title)
+	if err := s.repo.SetTitleNorm(ctx, src.ID, norm); err != nil {
+		if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
+			s.log.Warn("title norm write failed", "err", err, "source", src.ID)
+		}
+		return
+	}
+	hits := make([]similarHit, 0)
+	touched := map[uuid.UUID]struct{}{src.DocumentID: {}}
+	if norm != "" {
+		candidates, err := s.repo.ListTitleCandidates(ctx, src.ID, src.DocumentID)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
+				s.log.Warn("title similar candidates failed", "err", err, "source", src.ID)
+			}
+			return
+		}
+		for _, c := range candidates {
+			score := titlesim.ScoreNorm(norm, c.TitleNorm)
+			if score < titlesim.Threshold {
+				continue
+			}
+			hits = append(hits, similarHit{
+				MatchedSourceID: c.ID,
+				DocumentID:      c.DocumentID,
+				Score:           score,
+			})
+			touched[c.DocumentID] = struct{}{}
+		}
+		sort.Slice(hits, func(i, j int) bool {
+			if hits[i].Score == hits[j].Score {
+				return hits[i].MatchedSourceID.String() < hits[j].MatchedSourceID.String()
+			}
+			return hits[i].Score > hits[j].Score
+		})
+		if len(hits) > maxSimilarKept {
+			hits = hits[:maxSimilarKept]
+		}
+	}
+	if err := s.repo.ReplaceSimilar(ctx, src.ID, norm, hits); err != nil {
+		if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
+			s.log.Warn("title similar write failed", "err", err, "source", src.ID)
+		}
+		return
+	}
+	published := 0
+	for _, id := range sortedUUIDs(touched) {
+		doc, err := s.repo.Get(ctx, id)
+		if err != nil {
+			continue
+		}
+		s.hub.Publish(ctx, "document.updated", doc)
+		published++
+		if published >= 24 {
+			break
+		}
+	}
+}
+
+func titleRetryDelay(attempts int) time.Duration {
+	delays := [...]time.Duration{
+		20 * time.Second,
+		45 * time.Second,
+		2 * time.Minute,
+		5 * time.Minute,
+		15 * time.Minute,
+		30 * time.Minute,
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > len(delays) {
+		attempts = len(delays)
+	}
+	return delays[attempts-1]
 }
 
 func (s *Service) InspectFile(ctx context.Context, filename string, r io.Reader) PreviewResult {
@@ -739,58 +944,76 @@ func writeInspectTemp(r io.Reader, filename string, max int64) (string, error) {
 	return name, nil
 }
 
-func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader) engine.Result {
+func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader) (engine.Result, error) {
 	var out engine.Result
 	if s.engine == nil || !s.engine.Configured() {
-		return out
+		return out, nil
 	}
-	if !s.acquireTitle(ctx) {
-		return out
-	}
-	defer s.releaseTitle()
 	head := make([]byte, 16)
 	n, _ := io.ReadFull(r, head)
 	if n > 0 {
 		head = head[:n]
 	}
 	if fingerprint.Sniff(head, filename) != "pdf" {
-		return out
+		return out, nil
 	}
 	var reader io.Reader = r
 	if n > 0 {
 		reader = io.MultiReader(bytes.NewReader(head), r)
 	}
-	res, err := s.engine.Title(ctx, filename, reader)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res, err := s.engine.TitleNow(ctx, filename, reader)
 	if err != nil {
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
 		s.log.Warn("engine title failed", "err", err, "file", filename)
-		return engine.Result{OK: false, Filename: filename, Title: engine.UntitledDocument, Message: err.Error()}
+		return out, ErrEngineBusy
 	}
 	if res.Filename == "" {
 		res.Filename = filename
 	}
 	res.Title = engine.DisplayName(res)
-	return res
+	return res, nil
 }
 
 func (s *Service) titleSource(ctx context.Context, src Source) {
-	if s.engine == nil || !s.engine.Configured() {
-		return
-	}
 	key := src.ID.String()
 	if _, loaded := s.titling.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
 	defer s.titling.Delete(key)
+	s.runTitleSource(ctx, src)
+}
 
+func (s *Service) runTitleSource(ctx context.Context, src Source) {
+	if s.engine == nil || !s.engine.Configured() {
+		return
+	}
+	current, err := s.repo.GetSource(ctx, src.ID)
+	if errors.Is(err, ErrNotFound) {
+		return
+	}
+	if err == nil {
+		src = current
+		if engine.TitleSettled(src.Title) {
+			_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+			return
+		}
+	}
 	if !s.acquireTitle(ctx) {
+		_ = s.repo.DeferTitleRetry(ctx, src.ID, "")
 		return
 	}
 	defer s.releaseTitle()
-	err := retry.Do(ctx, 4, func(ctx context.Context) error {
+	err = retry.Do(ctx, 4, func(ctx context.Context) error {
+		live, liveErr := s.repo.GetSource(ctx, src.ID)
+		if liveErr == nil && engine.TitleSettled(live.Title) {
+			return s.repo.SetSourceTitle(ctx, src.ID, live.Title)
+		}
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
 		if errors.Is(err, blob.ErrNotFound) {
-			// The file is gone for good, so retrying forever would only burn
-			// engine capacity on every recovery sweep.
 			return s.repo.ClearNeedsTitle(ctx, src.ID)
 		}
 		if err != nil {
@@ -808,9 +1031,24 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 		if err != nil {
 			return err
 		}
-		if err := s.repo.SetSourceTitle(ctx, src.ID, engine.DisplayName(res)); err != nil {
+		name := engine.DisplayName(res)
+		if !engine.TitleSettled(name) {
+			if err := s.repo.DeferTitleRetry(ctx, src.ID, ""); err != nil {
+				return err
+			}
+			if doc, getErr := s.repo.Get(ctx, src.DocumentID); getErr == nil {
+				s.hub.Publish(ctx, "document.updated", doc)
+			}
+			return nil
+		}
+		if err := s.repo.SetSourceTitle(ctx, src.ID, name); err != nil {
 			return err
 		}
+		s.enqueueSimilar(s.jobContext(), []Source{{
+			ID:         src.ID,
+			DocumentID: src.DocumentID,
+			Title:      name,
+		}}, false)
 		doc, err := s.repo.Get(ctx, src.DocumentID)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
@@ -823,6 +1061,7 @@ func (s *Service) titleSource(ctx context.Context, src Source) {
 	})
 	if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
 		s.log.Warn("title source failed", "err", err, "source", src.ID)
+		_ = s.repo.DeferTitleRetry(ctx, src.ID, "")
 	}
 }
 
@@ -946,12 +1185,12 @@ type limitErrReader struct {
 
 func (l *limitErrReader) Read(p []byte) (int, error) {
 	if l.max > 0 && l.n >= l.max {
-		return 0, fmt.Errorf("file too large")
+		return 0, ErrTooLarge
 	}
 	n, err := l.r.Read(p)
 	l.n += int64(n)
 	if l.max > 0 && l.n > l.max {
-		return n, fmt.Errorf("file too large")
+		return n, ErrTooLarge
 	}
 	return n, err
 }

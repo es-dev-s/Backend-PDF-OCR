@@ -107,9 +107,11 @@ func TestMigratedSchemaHasColumnsTheCodeReads(t *testing.T) {
 			"created_at", "owner_id", "review_note", "review_requested_at", "notified_at"},
 		"sources": {"id", "document_id", "title", "storage_key", "content_type",
 			"size_bytes", "content_sha256", "uniqueness", "score", "created_at",
-			"needs_title", "note", "released"},
+			"needs_title", "note", "released", "title_attempts", "next_title_at",
+			"title_norm", "title_similar_at"},
 		"duplicate_matches": {"id", "source_id", "matched_source_id", "title", "erp",
 			"score", "uploaded_at", "kind"},
+		"title_similarities": {"id", "source_id", "matched_source_id", "score", "created_at"},
 	}
 	for table, columns := range want {
 		for _, column := range columns {

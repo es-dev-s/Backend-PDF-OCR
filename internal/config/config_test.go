@@ -82,3 +82,22 @@ func TestCapTitle(t *testing.T) {
 		t.Fatalf("degenerate -> %d want 1", got)
 	}
 }
+
+func TestNormalizeEngineURL(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"", "http://127.0.0.1:8000"},
+		{"http://127.0.0.1:8000", "http://127.0.0.1:8000"},
+		{"http://127.0.0.1:8000/", "http://127.0.0.1:8000"},
+		{"127.0.0.1:8000", "http://127.0.0.1:8000"},
+		{"localhost:8000", "http://localhost:8000"},
+		{"text-extracter-v2-production.up.railway.app", "https://text-extracter-v2-production.up.railway.app"},
+		{"https://text-extracter-v2-production.up.railway.app/", "https://text-extracter-v2-production.up.railway.app"},
+	}
+	for _, tt := range tests {
+		if got := normalizeEngineURL(tt.in); got != tt.want {
+			t.Fatalf("%q -> %q want %q", tt.in, got, tt.want)
+		}
+	}
+}

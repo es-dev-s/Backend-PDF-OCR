@@ -81,7 +81,7 @@ func main() {
 	pool := worker.New(cfg.WorkerN, log)
 	pool.Start(ctx, cfg.WorkerN)
 
-	eng := engine.New(cfg.EngineURL, log)
+	eng := engine.New(cfg.EngineURL, log, cfg.TitleConcurrency, cfg.MaxSources)
 	notes := notifications.NewRepo(pg.Handle, hub)
 	users := auth.NewRepo(pg.Handle)
 	docs := documents.NewService(documents.NewRepo(pg.Handle), store, hub, pool, notes, eng, log, cfg.MaxSources, cfg.MaxUploadBytes,
@@ -130,7 +130,7 @@ func main() {
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       90 * time.Second,
+		IdleTimeout:       5 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
 
@@ -139,6 +139,7 @@ func main() {
 			"addr", cfg.HTTPAddr,
 			"storage", store.Driver(),
 			"prefix", cfg.R2Prefix,
+			"engine", cfg.EngineURL,
 			"workers", cfg.WorkerN,
 			"memlimit", memlimit.Format(memlimit.Current()),
 			"cgroup", memlimit.Format(memlimit.CgroupLimit()),

@@ -34,7 +34,7 @@ func New(n int, log *slog.Logger) *Pool {
 	}
 	return &Pool{
 		log:  log,
-		jobs: make(chan Job, 256),
+		jobs: make(chan Job, 512),
 	}
 }
 

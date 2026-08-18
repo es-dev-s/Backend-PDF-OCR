@@ -26,8 +26,8 @@ const (
 
 type DuplicateMatch struct {
 	ID          uuid.UUID  `json:"id"`
-	SourceID    uuid.UUID  `json:"source_id,omitempty"`
-	DocumentID  uuid.UUID  `json:"document_id,omitempty"`
+	SourceID    uuid.UUID  `json:"source_id,omitzero"`
+	DocumentID  uuid.UUID  `json:"document_id,omitzero"`
 	Title       string     `json:"title"`
 	ERP         string     `json:"erp"`
 	Client      string     `json:"client,omitempty"`
@@ -39,6 +39,7 @@ type DuplicateMatch struct {
 	Kind        string     `json:"kind,omitempty"`
 	Uniqueness  Uniqueness `json:"uniqueness,omitempty"`
 	Note        string     `json:"note,omitempty"`
+	NoteLog     string     `json:"note_log,omitempty"`
 }
 
 type HashMatch struct {
@@ -85,41 +86,60 @@ type PreviewResult struct {
 	Matches    []PreviewMatch `json:"matches"`
 }
 
+type TitleSimilarMatch struct {
+	ID          uuid.UUID `json:"id"`
+	SourceID    uuid.UUID `json:"source_id,omitzero"`
+	DocumentID  uuid.UUID `json:"document_id,omitzero"`
+	Title       string    `json:"title"`
+	ERP         string    `json:"erp"`
+	Client      string    `json:"client,omitempty"`
+	Member      string    `json:"member,omitempty"`
+	Score       float64   `json:"score"`
+	Uploaded    time.Time `json:"uploaded_at"`
+	FileURL     string    `json:"file_url,omitempty"`
+	ContentType string    `json:"content_type,omitempty"`
+}
+
 type Source struct {
-	ID          uuid.UUID        `json:"id"`
-	DocumentID  uuid.UUID        `json:"document_id"`
-	Title       string           `json:"title"`
-	StorageKey  string           `json:"-"`
-	ContentType string           `json:"content_type"`
-	SizeBytes   int64            `json:"size_bytes"`
-	SHA256      *string          `json:"-"`
-	Uniqueness  Uniqueness       `json:"uniqueness"`
-	Score       *float64         `json:"score"`
-	Uploaded    time.Time        `json:"uploaded_at"`
-	FileURL     string           `json:"file_url"`
-	Duplicates  []DuplicateMatch `json:"duplicates"`
-	Note        string           `json:"note,omitempty"`
-	NeedsTitle  bool             `json:"-"`
-	Released    bool             `json:"-"`
+	ID           uuid.UUID           `json:"id"`
+	DocumentID   uuid.UUID           `json:"document_id"`
+	Title        string              `json:"title"`
+	StorageKey   string              `json:"-"`
+	ContentType  string              `json:"content_type"`
+	SizeBytes    int64               `json:"size_bytes"`
+	SHA256       *string             `json:"-"`
+	Uniqueness   Uniqueness          `json:"uniqueness"`
+	Score        *float64            `json:"score"`
+	Uploaded     time.Time           `json:"uploaded_at"`
+	FileURL      string              `json:"file_url"`
+	Duplicates   []DuplicateMatch    `json:"duplicates"`
+	TitleSimilar []TitleSimilarMatch `json:"title_similar,omitempty"`
+	Note         string              `json:"note,omitempty"`
+	NoteLog      string              `json:"note_log,omitempty"`
+	NeedsTitle   bool                `json:"needs_title,omitempty"`
+	Released     bool                `json:"-"`
 }
 
 type Document struct {
-	ID                uuid.UUID  `json:"id"`
-	Title             string     `json:"title"`
-	Uploader          string     `json:"uploader"`
-	Client            string     `json:"client"`
-	ERP               string     `json:"erp"`
-	ANZSCO            string     `json:"anzsco"`
-	Team              string     `json:"team"`
-	Member            string     `json:"member"`
-	Status            Status     `json:"status"`
-	Uploaded          time.Time  `json:"uploaded_at"`
-	URL               string     `json:"url"`
-	FileURL           string     `json:"file_url"`
-	Sources           []Source   `json:"sources"`
-	OwnerID           *uuid.UUID `json:"owner_id,omitempty"`
-	ReviewNote        string     `json:"review_note,omitempty"`
-	ReviewRequestedAt *time.Time `json:"review_requested_at,omitempty"`
+	ID                uuid.UUID           `json:"id"`
+	Title             string              `json:"title"`
+	Uploader          string              `json:"uploader"`
+	Client            string              `json:"client"`
+	ERP               string              `json:"erp"`
+	ANZSCO            string              `json:"anzsco"`
+	Team              string              `json:"team"`
+	Member            string              `json:"member"`
+	Status            Status              `json:"status"`
+	Uploaded          time.Time           `json:"uploaded_at"`
+	URL               string              `json:"url"`
+	FileURL           string              `json:"file_url"`
+	Sources           []Source            `json:"sources"`
+	OwnerID           *uuid.UUID          `json:"owner_id,omitempty"`
+	ReviewNote        string              `json:"review_note,omitempty"`
+	ReviewRequestedAt *time.Time          `json:"review_requested_at,omitempty"`
+	TitlePending      bool                `json:"title_pending,omitempty"`
+	TitleSimilar      []TitleSimilarMatch `json:"title_similar,omitempty"`
+	TitleSimilarCount int                 `json:"title_similar_count,omitempty"`
 }
 
 type CreateInput struct {
@@ -129,6 +149,7 @@ type CreateInput struct {
 	Team   string
 	Member string
 	Note   string
+	Notes  []string
 	Titles []string
 	Files  []IncomingFile
 }

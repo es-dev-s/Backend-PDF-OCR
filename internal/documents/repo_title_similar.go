@@ -72,18 +72,28 @@ func foldTitleSimilar(d *Document) {
 	if d == nil {
 		return
 	}
-	best := make(map[uuid.UUID]TitleSimilarMatch)
+	best := make(map[string]TitleSimilarMatch)
 	for i := range d.Sources {
 		src := &d.Sources[i]
 		kept := src.TitleSimilar[:0]
 		for _, m := range src.TitleSimilar {
-			if m.DocumentID == d.ID || m.DocumentID == uuid.Nil {
+			if m.DocumentID == uuid.Nil {
+				continue
+			}
+			if src.ID != uuid.Nil && m.SourceID == src.ID {
+				continue
+			}
+			if m.SourceID == uuid.Nil && m.DocumentID == d.ID {
 				continue
 			}
 			kept = append(kept, m)
-			prev, ok := best[m.DocumentID]
+			key := "d:" + m.DocumentID.String()
+			if m.DocumentID == d.ID {
+				key = "s:" + m.SourceID.String()
+			}
+			prev, ok := best[key]
 			if !ok || m.Score > prev.Score {
-				best[m.DocumentID] = m
+				best[key] = m
 			}
 		}
 		src.TitleSimilar = kept
@@ -153,7 +163,7 @@ func (r *Repo) SetTitleNorm(ctx context.Context, id uuid.UUID, titleNorm string)
 	return err
 }
 
-func (r *Repo) ListTitleCandidates(ctx context.Context, sourceID, documentID uuid.UUID) ([]titleCandidate, error) {
+func (r *Repo) ListTitleCandidates(ctx context.Context, sourceID uuid.UUID) ([]titleCandidate, error) {
 	db, err := r.db()
 	if err != nil {
 		return nil, err
@@ -164,9 +174,7 @@ func (r *Repo) ListTitleCandidates(ctx context.Context, sourceID, documentID uui
 		FROM sources s
 		JOIN documents d ON d.id = s.document_id
 		WHERE s.title_norm <> ''
-		  AND s.needs_title = FALSE
-		  AND s.id <> $1
-		  AND s.document_id <> $2`, sourceID, documentID)
+		  AND s.id <> $1`, sourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +188,27 @@ func (r *Repo) ListTitleCandidates(ctx context.Context, sourceID, documentID uui
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (r *Repo) HasUnreadyTitlePeers(ctx context.Context, documentID, sourceID uuid.UUID) (bool, error) {
+	db, err := r.db()
+	if err != nil {
+		return false, err
+	}
+	var n int
+	// Wait only while a sibling PDF is still extracting a printed title.
+	// Settled sources with an empty title_norm (images, unreadable scans)
+	// must not block, or mixed uploads never stamp similarities.
+	err = db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM sources
+		WHERE document_id = $1
+		  AND id <> $2
+		  AND needs_title = TRUE`, documentID, sourceID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (r *Repo) ReplaceSimilar(ctx context.Context, sourceID uuid.UUID, titleNorm string, hits []similarHit) error {

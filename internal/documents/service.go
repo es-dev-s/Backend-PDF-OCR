@@ -504,6 +504,7 @@ func (s *Service) RecoverPending(ctx context.Context) bool {
 		return more
 	}
 	if len(pendingSimilar) == 0 {
+		s.log.Info("recover sweep", "unhashed", len(sources), "titles", len(pendingTitles), "similar", 0)
 		return more
 	}
 	s.log.Info("requeue title similarity", "count", len(pendingSimilar))
@@ -523,11 +524,6 @@ func (s *Service) RunRecovery(ctx context.Context) {
 			return
 		case <-wait.C:
 		}
-	}
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(20 * time.Second):
 	}
 	more := s.RecoverPending(ctx)
 	t := time.NewTimer(recoverDelay(more))
@@ -687,6 +683,7 @@ func (s *Service) enqueueTitle(ctx context.Context, sources []Source, wait bool)
 		for _, src := range sources {
 			if engine.TitleSettled(src.Title) {
 				_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+				s.afterPrintedTitle(src, src.Title)
 				continue
 			}
 			if src.NeedsTitle {
@@ -698,6 +695,7 @@ func (s *Service) enqueueTitle(ctx context.Context, sources []Source, wait bool)
 	for _, src := range sources {
 		if engine.TitleSettled(src.Title) {
 			_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+			s.afterPrintedTitle(src, src.Title)
 			continue
 		}
 		if !src.NeedsTitle {
@@ -727,6 +725,12 @@ func (s *Service) enqueueTitle(ctx context.Context, sources []Source, wait bool)
 			}
 		}
 	}
+}
+
+func (s *Service) afterPrintedTitle(src Source, title string) {
+	src.Title = title
+	src.NeedsTitle = false
+	s.enqueueSimilar(s.jobContext(), []Source{src}, true)
 }
 
 func (s *Service) enqueueSimilar(ctx context.Context, sources []Source, wait bool) {
@@ -785,15 +789,17 @@ func (s *Service) similarSource(ctx context.Context, src Source) {
 		return
 	}
 	hits := make([]similarHit, 0)
+	candidateN := 0
 	touched := map[uuid.UUID]struct{}{src.DocumentID: {}}
 	if norm != "" {
-		candidates, err := s.repo.ListTitleCandidates(ctx, src.ID, src.DocumentID)
+		candidates, err := s.repo.ListTitleCandidates(ctx, src.ID)
 		if err != nil {
 			if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
 				s.log.Warn("title similar candidates failed", "err", err, "source", src.ID)
 			}
 			return
 		}
+		candidateN = len(candidates)
 		for _, c := range candidates {
 			score := titlesim.ScoreNorm(norm, c.TitleNorm)
 			if score < titlesim.Threshold {
@@ -816,12 +822,25 @@ func (s *Service) similarSource(ctx context.Context, src Source) {
 			hits = hits[:maxSimilarKept]
 		}
 	}
+	if len(hits) == 0 {
+		unready, err := s.repo.HasUnreadyTitlePeers(ctx, src.DocumentID, src.ID)
+		if err != nil {
+			if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
+				s.log.Warn("title similar peers failed", "err", err, "source", src.ID)
+			}
+			return
+		}
+		if unready {
+			return
+		}
+	}
 	if err := s.repo.ReplaceSimilar(ctx, src.ID, norm, hits); err != nil {
 		if !errors.Is(err, ErrNotFound) && !errors.Is(err, context.Canceled) {
 			s.log.Warn("title similar write failed", "err", err, "source", src.ID)
 		}
 		return
 	}
+	s.log.Info("title similar scanned", "source", src.ID, "candidates", candidateN, "hits", len(hits))
 	published := 0
 	for _, id := range sortedUUIDs(touched) {
 		doc, err := s.repo.Get(ctx, id)
@@ -999,6 +1018,7 @@ func (s *Service) runTitleSource(ctx context.Context, src Source) {
 		src = current
 		if engine.TitleSettled(src.Title) {
 			_ = s.repo.SetSourceTitle(ctx, src.ID, src.Title)
+			s.afterPrintedTitle(src, src.Title)
 			return
 		}
 	}
@@ -1010,7 +1030,11 @@ func (s *Service) runTitleSource(ctx context.Context, src Source) {
 	err = retry.Do(ctx, 4, func(ctx context.Context) error {
 		live, liveErr := s.repo.GetSource(ctx, src.ID)
 		if liveErr == nil && engine.TitleSettled(live.Title) {
-			return s.repo.SetSourceTitle(ctx, src.ID, live.Title)
+			if err := s.repo.SetSourceTitle(ctx, src.ID, live.Title); err != nil {
+				return err
+			}
+			s.afterPrintedTitle(live, live.Title)
+			return nil
 		}
 		path, err := s.blob.LocalPath(ctx, src.StorageKey)
 		if errors.Is(err, blob.ErrNotFound) {
@@ -1044,11 +1068,7 @@ func (s *Service) runTitleSource(ctx context.Context, src Source) {
 		if err := s.repo.SetSourceTitle(ctx, src.ID, name); err != nil {
 			return err
 		}
-		s.enqueueSimilar(s.jobContext(), []Source{{
-			ID:         src.ID,
-			DocumentID: src.DocumentID,
-			Title:      name,
-		}}, false)
+		s.afterPrintedTitle(src, name)
 		doc, err := s.repo.Get(ctx, src.DocumentID)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {

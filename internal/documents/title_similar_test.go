@@ -43,3 +43,29 @@ func TestFoldTitleSimilarUniquesByDocument(t *testing.T) {
 		t.Fatalf("self match must be dropped from source, got %d", len(d.Sources[0].TitleSimilar))
 	}
 }
+
+func TestFoldTitleSimilarKeepsSiblingOnSameDocument(t *testing.T) {
+	docID := uuid.New()
+	srcA := uuid.New()
+	srcB := uuid.New()
+	now := time.Now().UTC()
+	d := Document{
+		ID: docID,
+		Sources: []Source{
+			{
+				ID: srcA,
+				TitleSimilar: []TitleSimilarMatch{
+					{ID: uuid.New(), SourceID: srcB, DocumentID: docID, Title: "sibling", Score: 0.67, Uploaded: now},
+					{ID: uuid.New(), SourceID: srcA, DocumentID: docID, Title: "self", Score: 1, Uploaded: now},
+				},
+			},
+		},
+	}
+	foldTitleSimilar(&d)
+	if len(d.Sources[0].TitleSimilar) != 1 || d.Sources[0].TitleSimilar[0].SourceID != srcB {
+		t.Fatalf("keep sibling drop self: %+v", d.Sources[0].TitleSimilar)
+	}
+	if d.TitleSimilarCount != 1 || d.TitleSimilar[0].SourceID != srcB {
+		t.Fatalf("document list=%+v", d.TitleSimilar)
+	}
+}

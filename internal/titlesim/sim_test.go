@@ -1,6 +1,7 @@
 package titlesim
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -12,6 +13,7 @@ func TestNormalize(t *testing.T) {
 		{"The Journey of Man", "the journey of man"},
 		{"  The, Journey! of  Man. ", "the journey of man"},
 		{"notes.pdf", ""},
+		{"Design, and Finite Element Analysis of a Peanut.pdf", "design and finite element analysis of a peanut"},
 		{"Untitled document", ""},
 		{"Title not readable (scanned PDF)", ""},
 		{"", ""},
@@ -59,6 +61,39 @@ func TestWordCoverageRejectsShortOverlap(t *testing.T) {
 	long := "Kinetic Study of Esterification of Acetic Acid with nbutanol and isobutanol Catalyzed by Ion Exchange Resin"
 	if Score("Study of Acid", long) >= Threshold {
 		t.Fatal("a few shared words must not match a long title")
+	}
+}
+
+func TestPeanutTitlesAreCompared(t *testing.T) {
+	a := "Design, and Finite Element Analysis of a Peanut"
+	b := "Design, and Finite Element Analysis of a Peanut System for Soils"
+	score := Score(a, b)
+	// design, finite, element, analysis, peanut vs those plus system, soils
+	// Dice 2*5/(5+7) = 0.833
+	if score < 0.82 || score > 0.85 {
+		t.Fatalf("peanut score=%.4f want ~0.833", score)
+	}
+	if !Match(a, b) {
+		t.Fatal("near-identical peanut titles must be stored as similar")
+	}
+	if got := int(math.Round(score * 100)); got != 83 {
+		t.Fatalf("percent=%d want 83", got)
+	}
+}
+
+func TestHometownSubsetIsCompared(t *testing.T) {
+	a := "The home town of nepali"
+	b := "The simulation of purely nature and home town of nepal"
+	score := Score(a, b)
+	// home, town, nepali≈nepal vs six content words → Dice 2*3/9 = 0.667
+	if score < 0.65 || score > 0.68 {
+		t.Fatalf("subset score=%.4f want ~0.667", score)
+	}
+	if score >= Threshold {
+		t.Fatal("67% hometown overlap must stay below the 70% similar cap")
+	}
+	if got := int(math.Round(score * 100)); got != 67 {
+		t.Fatalf("percent=%d want 67", got)
 	}
 }
 

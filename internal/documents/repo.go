@@ -387,7 +387,10 @@ func (r *Repo) HealSettledTitles(ctx context.Context) (int64, error) {
 		WHERE needs_title = TRUE
 		  AND title <> ''
 		  AND title <> 'Untitled document'
-		  AND lower(title) NOT LIKE '%.pdf'`)
+		  AND (
+		        lower(title) NOT LIKE '%.pdf'
+		     OR title LIKE '% %'
+		  )`)
 	if err != nil {
 		return 0, err
 	}

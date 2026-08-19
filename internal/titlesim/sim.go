@@ -6,10 +6,13 @@ import (
 )
 
 const (
-	Threshold = 0.90
-	wordMin   = 0.85
+	// Threshold is Dice similarity (2*shared / (lenA+lenB)). Only titles
+	// at or above 70% are stored as similar.
+	Threshold = 0.70
+	wordMin   = 0.80
 	minRunes  = 8
 	shortWord = 4
+	minMatch  = 2
 )
 
 var stop = map[string]struct{}{
@@ -27,7 +30,7 @@ func Normalize(s string) string {
 		return ""
 	}
 	if strings.HasSuffix(s, ".pdf") {
-		return ""
+		s = strings.TrimSpace(s[:len(s)-4])
 	}
 	var b strings.Builder
 	b.Grow(len(s))
@@ -43,7 +46,12 @@ func Normalize(s string) string {
 			space = true
 		}
 	}
-	return strings.TrimSpace(b.String())
+	out := strings.TrimSpace(b.String())
+	// A paper heading has spaces. A single slug is an upload name.
+	if out == "" || !strings.Contains(out, " ") {
+		return ""
+	}
+	return out
 }
 
 // Tokens are the content words used for similarity. Stopwords are dropped.
@@ -59,8 +67,8 @@ func Tokens(norm string) []string {
 	return out
 }
 
-// Score is 0..1 from how many content words align, using the longer title
-// as the denominator so a short phrase cannot match a long unrelated one.
+// Score is Dice similarity in 0..1: twice the aligned content words over
+// the total content-word count of both titles. Identical titles are 1.
 func Score(a, b string) float64 {
 	return ScoreNorm(Normalize(a), Normalize(b))
 }
@@ -77,18 +85,18 @@ func ScoreNorm(left, right string) float64 {
 	if len(a) == 0 || len(b) == 0 {
 		return 0
 	}
-	if (runeLen(left) < minRunes || runeLen(right) < minRunes) && left != right {
+	if runeLen(left) < minRunes || runeLen(right) < minRunes {
 		return 0
 	}
 	matched, _, _ := Align(a, b)
-	den := len(a)
-	if len(b) > den {
-		den = len(b)
+	if matched < minMatch {
+		return 0
 	}
+	den := len(a) + len(b)
 	if den == 0 {
 		return 0
 	}
-	return float64(matched) / float64(den)
+	return 2 * float64(matched) / float64(den)
 }
 
 func Match(a, b string) bool {
@@ -96,7 +104,8 @@ func Match(a, b string) bool {
 }
 
 // Align pairs content words greedily. A word counts as the same when it is
-// identical, or (if long enough) when its spelling is at least wordMin.
+// identical, or (if long enough) when its spelling is at least wordMin
+// (so nepal / nepali still align).
 func Align(a, b []string) (matched int, aHit, bHit []bool) {
 	aHit = make([]bool, len(a))
 	bHit = make([]bool, len(b))

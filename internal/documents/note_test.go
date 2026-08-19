@@ -47,6 +47,19 @@ func TestNoteForFile(t *testing.T) {
 	}
 }
 
+func TestNoteForFileKeepsPerDuplicateReasons(t *testing.T) {
+	notes := []string{"", "keep scanned copy", "client asked for both"}
+	if got := noteForFile(notes, 0, ""); got != "" {
+		t.Fatalf("unique file must not inherit a note: %q", got)
+	}
+	if got := noteForFile(notes, 1, ""); got != "keep scanned copy" {
+		t.Fatalf("first duplicate: %q", got)
+	}
+	if got := noteForFile(notes, 2, ""); got != "client asked for both" {
+		t.Fatalf("second duplicate: %q", got)
+	}
+}
+
 func TestMergeReviewNote(t *testing.T) {
 	if got := mergeReviewNote("old", ""); got != "old" {
 		t.Fatalf("keep existing: %q", got)

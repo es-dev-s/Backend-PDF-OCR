@@ -21,6 +21,17 @@ import (
 //go:embed sql/*.sql
 var sqlFS embed.FS
 
+type lastError struct{ err error }
+
+func putErr(v *atomic.Value, err error) {
+	v.Store(lastError{err})
+}
+
+func getErr(v *atomic.Value) error {
+	box, _ := v.Load().(lastError)
+	return box.err
+}
+
 type Pool struct {
 	mu      sync.RWMutex
 	pool    *pgxpool.Pool
@@ -39,7 +50,7 @@ func New(url string, log *slog.Logger, maxConns int32) *Pool {
 		maxConns = 32
 	}
 	p := &Pool{url: url, log: log, maxConn: maxConns}
-	p.lastErr.Store(fmt.Errorf("postgres not connected"))
+	putErr(&p.lastErr, fmt.Errorf("postgres not connected"))
 	return p
 }
 
@@ -157,10 +168,10 @@ func (p *Pool) set(pool *pgxpool.Pool, err error) {
 	p.pool = pool
 	p.mu.Unlock()
 	if err != nil {
-		p.lastErr.Store(err)
+		putErr(&p.lastErr, err)
 		p.ready.Store(false)
 	} else {
-		p.lastErr.Store(fmt.Errorf(""))
+		putErr(&p.lastErr, nil)
 		p.ready.Store(pool != nil)
 	}
 	if old != nil && old != pool {
@@ -181,7 +192,7 @@ func (p *Pool) Status() (string, error) {
 	if p.ready.Load() && p.Handle() != nil {
 		return "ok", nil
 	}
-	err, _ := p.lastErr.Load().(error)
+	err := getErr(&p.lastErr)
 	if err != nil && err.Error() != "" {
 		return "down", err
 	}

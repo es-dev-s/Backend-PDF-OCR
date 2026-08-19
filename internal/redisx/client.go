@@ -14,6 +14,17 @@ import (
 	"ocr-backend/internal/retry"
 )
 
+type lastError struct{ err error }
+
+func putErr(v *atomic.Value, err error) {
+	v.Store(lastError{err})
+}
+
+func getErr(v *atomic.Value) error {
+	box, _ := v.Load().(lastError)
+	return box.err
+}
+
 type Client struct {
 	mu      sync.RWMutex
 	rdb     *redis.Client
@@ -32,7 +43,7 @@ func New(url string, log *slog.Logger, poolSize int) *Client {
 		poolSize = 32
 	}
 	c := &Client{url: url, log: log, poolN: poolSize}
-	c.lastErr.Store(fmt.Errorf("redis not connected"))
+	putErr(&c.lastErr, fmt.Errorf("redis not connected"))
 	return c
 }
 
@@ -135,10 +146,10 @@ func (c *Client) set(rdb *redis.Client, err error) {
 	c.rdb = rdb
 	c.mu.Unlock()
 	if err != nil {
-		c.lastErr.Store(err)
+		putErr(&c.lastErr, err)
 		c.ready.Store(false)
 	} else {
-		c.lastErr.Store(fmt.Errorf(""))
+		putErr(&c.lastErr, nil)
 		c.ready.Store(rdb != nil)
 	}
 	if old != nil && old != rdb {
@@ -159,7 +170,7 @@ func (c *Client) Status() (string, error) {
 	if c.ready.Load() && c.Handle() != nil {
 		return "ok", nil
 	}
-	err, _ := c.lastErr.Load().(error)
+	err := getErr(&c.lastErr)
 	if err != nil && err.Error() != "" {
 		return "down", err
 	}

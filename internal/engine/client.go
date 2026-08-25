@@ -20,10 +20,12 @@ import (
 
 const (
 	MaxTitleBytes    = 50 << 20
+	maxTitleResponse = 32 << 20
 	TitleTimeout     = 120 * time.Second
 	UntitledDocument = "Untitled document"
 	UnreadableTitle  = "Title not readable (scanned PDF)"
 	noOCRMessage     = "No OCR"
+	titleOnlyQuery   = "/v1/ocr?title_only=1"
 )
 
 type Result struct {
@@ -222,7 +224,12 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader, qu
 
 	reqCtx, cancel := context.WithTimeout(ctx, TitleTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base+"/v1/ocr", &buf)
+	// title_only keeps the JSON to the heading fields. The full extract
+	// payload includes every page of text, which used to blow past the 4MiB
+	// read cap so json.Unmarshal failed after the engine had already titled
+	// the PDF. The form then sat on "Generating title…" while a direct
+	// engine call showed the heading immediately.
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.base+titleOnlyQuery, &buf)
 	if err != nil {
 		return out, 0, err
 	}
@@ -234,7 +241,13 @@ func (c *Client) roundTrip(ctx context.Context, filename string, r io.Reader, qu
 		return out, 2 * time.Second, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTitleResponse+1))
+	if err != nil {
+		return out, 2 * time.Second, err
+	}
+	if len(body) > maxTitleResponse {
+		return out, 0, fmt.Errorf("engine response too large")
+	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		wait := 60 * time.Second

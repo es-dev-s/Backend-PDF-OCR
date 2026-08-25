@@ -1,6 +1,15 @@
 package engine
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestPrintedTitleRejectsFilenames(t *testing.T) {
 	if got := PrintedTitle("3.Our.ME_Project_Study_2.pdf"); got != "" {
@@ -91,5 +100,65 @@ func TestTitleSettled(t *testing.T) {
 	}
 	if !TitleSettled(UnreadableTitle) {
 		t.Fatal("unreadable scan is settled")
+	}
+}
+
+func TestTitleNowReadsTitleFromLargeEngineBody(t *testing.T) {
+	want := "Design and Fabrication of River Cleaning Machine"
+	var sawTitleOnly bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/ocr" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("title_only") == "1" {
+			sawTitleOnly = true
+		}
+		payload, err := json.Marshal(map[string]any{
+			"ok":      true,
+			"method":  "native",
+			"title":   want,
+			"content": strings.Repeat("x", 5<<20),
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, nil, 1, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := c.TitleNow(ctx, "doc.pdf", bytes.NewReader([]byte("%PDF-1.4 test")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawTitleOnly {
+		t.Fatal("form title must ask the engine for title_only")
+	}
+	if got := DisplayName(res); got != want {
+		t.Fatalf("title: %q", got)
+	}
+}
+
+func TestTruncatedEngineJSONCannotBeParsed(t *testing.T) {
+	// The old 4MiB LimitReader cut through `content`, so Unmarshal failed
+	// even though `title` was in the first kilobyte.
+	raw, err := json.Marshal(map[string]any{
+		"ok":      true,
+		"method":  "native",
+		"title":   "Design and Fabrication of River Cleaning Machine",
+		"content": strings.Repeat("x", 5<<20),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := raw[:4<<20]
+	var parsed extractBody
+	if json.Unmarshal(cut, &parsed) == nil {
+		t.Fatal("truncated extract JSON should not parse")
 	}
 }

@@ -980,7 +980,11 @@ func (s *Service) SuggestTitle(ctx context.Context, filename string, r io.Reader
 	if n > 0 {
 		reader = io.MultiReader(bytes.NewReader(head), r)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Same budget as the engine client, the Next rewrite, and the extractor
+	// UI. 30s used to cancel the upstream call while Groq/OCR was still
+	// finishing, so the form retried forever on "Generating title…" even
+	// though a direct engine upload returned the heading.
+	ctx, cancel := context.WithTimeout(ctx, engine.TitleTimeout)
 	defer cancel()
 	res, err := s.engine.TitleNow(ctx, filename, reader)
 	if err != nil {
